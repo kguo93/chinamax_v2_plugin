@@ -136,6 +136,8 @@ async def forward_relay(
     key: str,
     session: aiohttp.ClientSession,
     upstream_path: str,
+    *,
+    usage_tee: object = None,
 ) -> web.StreamResponse:
     """Mutate, auth-swap, and forward one relay request; stream the response back verbatim.
 
@@ -146,10 +148,15 @@ async def forward_relay(
         key: The Profile's injected API key (already resolved non-empty).
         session: The app-scoped upstream ``ClientSession`` (``auto_decompress=False``).
         upstream_path: The path appended to the Profile ``base_url`` (e.g. ``/v1/messages``).
+        usage_tee: An optional passive tee (proxy-04's ``AnthropicUsageTee``) handed the
+            upstream status/content-type and every response chunk for usage accounting. It
+            never alters the relayed bytes; ``None`` disables the tee entirely.
 
     Returns:
         The streamed upstream response, or the pinned 502 when the upstream connection
-        fails before any response headers are committed downstream.
+        fails before any response headers are committed downstream. A mid-stream failure
+        (provider abort or client disconnect) returns the already-committed response so the
+        caller can log the upstream status with the usage merged so far.
     """
     out_bytes = serialize_body(mutate_body(profile, json.loads(body)))
     url = _relay_url(profile.base_url, upstream_path)
@@ -160,18 +167,27 @@ async def forward_relay(
         async with session.request(
             "POST", url, headers=headers, data=out_bytes, allow_redirects=False
         ) as upstream:
+            if usage_tee is not None:
+                usage_tee.begin(upstream.status, upstream.headers.get("Content-Type", ""))
             client_response = web.StreamResponse(status=upstream.status)
             for name, value in _relay_response_headers(upstream.headers):
                 client_response.headers.add(name, value)
             await client_response.prepare(request)
             async for chunk in upstream.content.iter_any():
+                if usage_tee is not None:
+                    usage_tee.feed(chunk)  # captured before the write, bytes never altered
                 await client_response.write(chunk)
             await client_response.write_eof()
+            if usage_tee is not None:
+                usage_tee.finish()
             return client_response
-    except (aiohttp.ClientError, asyncio.TimeoutError):
+    except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
+        if usage_tee is not None:
+            usage_tee.finish()
         if client_response is not None and client_response.prepared:
-            # Headers already committed downstream: a mid-stream failure can only
-            # truncate — the connection simply terminates, no status rewrite.
+            # Headers already committed downstream: a mid-stream failure (provider abort or
+            # client disconnect) can only truncate — the connection simply terminates, no
+            # status rewrite; the caller logs the upstream status with usage merged so far.
             return client_response
         return _upstream_failed_response()
 

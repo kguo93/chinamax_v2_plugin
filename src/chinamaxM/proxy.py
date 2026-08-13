@@ -26,19 +26,23 @@ binds ``127.0.0.1`` on the Registry port.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
+import time
+from dataclasses import dataclass
 
 import aiohttp
 import yarl
 from aiohttp import web
 from multidict import CIMultiDict
 
-from chinamaxM import seam
+from chinamaxM import observability, seam
 from chinamaxM.keyfiles import KEY_FILE_NAME, KeyFileReader, resolve_host_root, scaffold_key_file
 from chinamaxM.registry import Profile, Registry, load_registry
 from chinamaxM.relay import (
     forward_relay,
     make_relay_request_headers,
+    mutate_body,
     relay_upstream_url,
     serialize_body,
 )
@@ -95,9 +99,11 @@ def create_app(
         claude_home: An explicit Claude Host root that wins over the environment chain
             (ADR 0006 as amended); tests inject a temp root here.
         codex_home: An explicit Codex Host root, resolved the same way.
-        log_sink: An injectable callable receiving one Seam record dict per Responses
-            request (proxy-04 plugs in the JSONL writer); ``None`` means a no-op. Sink
-            exceptions are always caught so observability never fails a valid response.
+        log_sink: An injectable callable receiving one finalized JSONL line per worker
+            request on BOTH branches (ADR 0010). ``None`` (the production default) builds the
+            append-only :class:`~chinamaxM.observability.JsonlRequestLog` over the resolved
+            Claude root; a test passes its own callable to capture lines. Sink exceptions are
+            always caught so observability never fails a valid response.
 
     Returns:
         The configured, unstarted aiohttp application.
@@ -110,7 +116,17 @@ def create_app(
     app["codex_root"] = resolve_host_root("codex", codex_home)
     app["claude_keys"] = KeyFileReader(app["claude_root"] / KEY_FILE_NAME)
     app["codex_keys"] = KeyFileReader(app["codex_root"] / KEY_FILE_NAME)
-    app["seam_log_sink"] = log_sink if callable(log_sink) else (lambda record: None)
+    if log_sink is None:
+        writer = observability.JsonlRequestLog(
+            observability.resolve_log_path(app["claude_root"])
+        )
+        app["log_writer"] = writer
+        app["log_sink"] = writer
+    else:
+        app["log_writer"] = None
+        app["log_sink"] = log_sink if callable(log_sink) else (lambda record: None)
+    #: Per-Profile negative cache of count_tokens support, keyed (name, base_url); ADR 0010.
+    app["count_tokens_unsupported"] = set()
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     app.router.add_post("/v1/messages", _messages_handler)
@@ -143,63 +159,242 @@ def _scaffold_key_files(app: web.Application) -> None:
 
 
 async def _on_cleanup(app: web.Application) -> None:
-    """Close the app-scoped upstream ``ClientSession``."""
+    """Close the app-scoped upstream ``ClientSession`` and the request-log descriptor."""
     await app["session"].close()
+    if app["log_writer"] is not None:
+        app["log_writer"].close()
+
+
+@dataclass
+class _Completion:
+    """Mutable accumulator for one worker request's JSONL line (ADR 0010).
+
+    Fields fill in as the request proceeds; :func:`_finalize` writes exactly one line in a
+    cancellation-safe try/finally. A ``status`` left ``None`` means the handler was cancelled
+    before any status was known (a client disconnect before the upstream responded) and is
+    logged as 499.
+    """
+
+    ingress: str
+    profile: str | None = None
+    upstream: str | None = None
+    model: str | None = None
+    status: int | None = None
+    usage: dict | None = None
+    stripped_tools: list | None = None
+    count_tokens_path: str | None = None
+
+
+def _finalize(request: web.Request, comp: _Completion, start: float) -> None:
+    """Assemble and write one JSONL line; the sink is best-effort and never fails a request.
+
+    ``stripped_tools`` appears only when the Seam dropped tool types; ``count_tokens_path``
+    only on count_tokens lines that forwarded or estimated. ``usage`` is the provider object
+    verbatim, or ``null``.
+    """
+    line: dict = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "ingress": comp.ingress,
+        "model": comp.model,
+        "profile": comp.profile,
+        "upstream": comp.upstream,
+        "status": comp.status if comp.status is not None else 499,
+        "latency": time.monotonic() - start,
+        "usage": comp.usage,
+    }
+    if comp.stripped_tools:
+        line["stripped_tools"] = comp.stripped_tools
+    if comp.count_tokens_path is not None:
+        line["count_tokens_path"] = comp.count_tokens_path
+    try:
+        request.app["log_sink"](line)
+    except Exception:  # observability must never corrupt a valid response
+        pass
+
+
+def _stripped_model(body: bytes) -> str | None:
+    """Return the forwarded model (Profile prefix stripped) from a routed request body."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    model = payload.get("model") if isinstance(payload, dict) else None
+    if not isinstance(model, str):
+        return None
+    return model.split("/", 1)[1] if "/" in model else model
 
 
 async def _messages_handler(request: web.Request) -> web.StreamResponse:
     """Route POST /v1/messages by Profile prefix; Anthropic matches ride the Relay branch.
 
     The body is buffered (routed paths must peek the model string); a Default match
-    forwards those same bytes, an Anthropic-dialect match relays, a ``responses``-dialect
-    match stays 501 (proxy-03).
+    forwards those same bytes UNLOGGED, an Anthropic-dialect match relays, a
+    ``responses``-dialect match logs a local 501 (proxy-03). Every matched request appends
+    exactly one JSONL line, finalized in a cancellation-safe try/finally.
 
     Returns:
         The upstream passthrough, a relayed response, a local 404, a 401, or a 501 marker.
     """
+    start = time.monotonic()
     body = await request.read()
-    kind, profile = _route(body, request.app["registry"])
+    registry = request.app["registry"]
+    kind, profile = _route(body, registry)
     if kind == "default":
         return await _forward(request, body=body)
     if kind == "unknown":
-        return _unknown_profile_response(request.app["registry"])
-    if profile.dialect != "anthropic":
-        return _not_implemented_response(
-            "relay not yet implemented", profile, request.app["routing_debug"]
-        )
-    return await _relay(request, body, profile)
+        return _unknown_profile_response(registry)
+    comp = _Completion(
+        ingress="anthropic",
+        profile=profile.name,
+        upstream=str(relay_upstream_url(profile.base_url, "/v1/messages")),
+        model=_stripped_model(body),
+    )
+    try:
+        if profile.dialect != "anthropic":
+            comp.status = 501
+            return _not_implemented_response(
+                "relay not yet implemented", profile, request.app["routing_debug"]
+            )
+        return await _relay(request, body, profile, comp)
+    finally:
+        _finalize(request, comp, start)
 
 
 async def _count_tokens_handler(request: web.Request) -> web.StreamResponse:
-    """Route POST /v1/messages/count_tokens; matched Profiles stay 501 (proxy-04 owns relay).
+    """Route POST /v1/messages/count_tokens: forward on the Relay branch with an estimator.
+
+    A Default match passes through UNLOGGED; a ``responses``-dialect match logs a local 501.
+    An Anthropic-dialect match forwards the mutated body to the Profile's count_tokens
+    endpoint and synthesizes ``ceil(chars/4)`` on 404/405/501, a malformed 2xx, or a
+    transport failure (ADR 0010 as amended). Every matched request appends one JSONL line.
 
     Returns:
-        The upstream passthrough, a local 404, or the 501 count_tokens marker.
+        The upstream passthrough, a local 404, a relayed/estimated count, a 401, or a 501.
     """
+    start = time.monotonic()
     body = await request.read()
-    kind, profile = _route(body, request.app["registry"])
+    registry = request.app["registry"]
+    kind, profile = _route(body, registry)
     if kind == "default":
         return await _forward(request, body=body)
     if kind == "unknown":
-        return _unknown_profile_response(request.app["registry"])
-    return _not_implemented_response(
-        "count_tokens relay not yet implemented", profile, request.app["routing_debug"]
+        return _unknown_profile_response(registry)
+    comp = _Completion(
+        ingress="anthropic",
+        profile=profile.name,
+        upstream=str(relay_upstream_url(profile.base_url, "/v1/messages/count_tokens")),
+        model=_stripped_model(body),
     )
+    try:
+        if profile.dialect != "anthropic":
+            comp.status = 501
+            return _not_implemented_response(
+                "count_tokens relay not yet implemented", profile, request.app["routing_debug"]
+            )
+        return await _count_tokens(request, body, profile, comp)
+    finally:
+        _finalize(request, comp, start)
 
 
-async def _relay(request: web.Request, body: bytes, profile: Profile) -> web.StreamResponse:
+async def _relay(
+    request: web.Request, body: bytes, profile: Profile, comp: _Completion
+) -> web.StreamResponse:
     """Inject the Profile's key from the Claude Key file and forward on the Relay branch.
 
-    A missing or empty key fails CLOSED with a 401 naming the variable and Key file;
-    nothing is sent upstream.
+    A missing or empty key fails CLOSED with a 401 naming the variable and Key file; nothing
+    is sent upstream. Usage is extracted by a passive tee over the provider-side Anthropic
+    response/SSE (relayed bytes never altered) and logged only for a 2xx upstream status.
     """
     reader = request.app["claude_keys"]
     key = reader.get(profile.api_key_env)
     if not key:
+        comp.status = 401
         return _auth_error_response(profile.api_key_env, reader.path)
-    return await forward_relay(
-        request, body, profile, key, request.app["session"], "/v1/messages"
-    )
+    tee = observability.AnthropicUsageTee()
+    response: web.StreamResponse | None = None
+    try:
+        response = await forward_relay(
+            request, body, profile, key, request.app["session"], "/v1/messages", usage_tee=tee
+        )
+        return response
+    finally:
+        # Record status/usage from the tee even under cancellation (a client disconnect
+        # mid-stream cancels the handler, so ``forward_relay`` never returns): the upstream
+        # status is already known once headers arrived, with the usage merged so far.
+        if tee.status is not None:
+            comp.status = tee.status
+            if 200 <= tee.status < 300:
+                comp.usage = tee.usage
+        elif response is not None:
+            comp.status = response.status
+        # else: cancelled before any upstream status ⇒ comp.status stays None ⇒ logged 499.
+
+
+async def _count_tokens(
+    request: web.Request, body: bytes, profile: Profile, comp: _Completion
+) -> web.StreamResponse:
+    """Forward count_tokens to the Profile endpoint, or synthesize the estimate on a gap.
+
+    Reuses the relay serializer/headers so the counted body is exactly what messages will
+    send (serialized once — the estimate counts those same bytes). A cached-unsupported
+    Profile skips the upstream attempt; a fresh 404/405/501 or malformed 2xx populates that
+    negative cache; a transport failure estimates WITHOUT caching; any other upstream status
+    passes through verbatim.
+    """
+    reader = request.app["claude_keys"]
+    key = reader.get(profile.api_key_env)
+    if not key:
+        comp.status = 401
+        return _auth_error_response(profile.api_key_env, reader.path)
+
+    egress_bytes = serialize_body(mutate_body(profile, json.loads(body)))
+    cache = request.app["count_tokens_unsupported"]
+    cache_key = (profile.name, profile.base_url)
+    if cache_key in cache:
+        return _estimated_count(comp, egress_bytes)
+
+    url = relay_upstream_url(profile.base_url, "/v1/messages/count_tokens")
+    headers = make_relay_request_headers(request.headers, key)
+    try:
+        async with request.app["session"].request(
+            "POST", url, headers=headers, data=egress_bytes, allow_redirects=False
+        ) as upstream:
+            status = upstream.status
+            raw = await upstream.read()
+            content_type = upstream.headers.get("Content-Type")
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        # Transport failure ⇒ estimate, but NEVER cache as unsupported (ADR 0010).
+        return _estimated_count(comp, egress_bytes)
+
+    if status in (404, 405, 501):
+        cache.add(cache_key)
+        return _estimated_count(comp, egress_bytes)
+    if 200 <= status < 300:
+        if observability.valid_count_tokens_body(raw) is None:
+            cache.add(cache_key)  # malformed 2xx ⇒ unsupported
+            return _estimated_count(comp, egress_bytes)
+        comp.status = status
+        comp.count_tokens_path = "upstream"
+        return _count_tokens_passthrough(status, content_type, raw)
+    # Any other upstream status (non-2xx besides 404/405/501, redirects) relays verbatim.
+    comp.status = status
+    return _count_tokens_passthrough(status, content_type, raw)
+
+
+def _estimated_count(comp: _Completion, egress_bytes: bytes) -> web.Response:
+    """Answer count_tokens with the synthesized ``ceil(chars/4)`` estimate (status 200)."""
+    comp.status = 200
+    comp.count_tokens_path = "estimated"
+    tokens = observability.estimate_input_tokens(egress_bytes)
+    return web.json_response({"input_tokens": tokens}, status=200)
+
+
+def _count_tokens_passthrough(
+    status: int, content_type: str | None, raw: bytes
+) -> web.Response:
+    """Relay an upstream count_tokens response verbatim (status + body + content type)."""
+    headers = {"Content-Type": content_type} if content_type else None
+    return web.Response(status=status, body=raw, headers=headers)
 
 
 async def _openai_handler(request: web.Request) -> web.StreamResponse:
@@ -231,29 +426,50 @@ async def _seam_dispatch(request: web.Request, profile: Profile) -> web.StreamRe
 
     Injects the Profile key from the Codex Key file (Responses ingress → Codex file); a
     missing key fails CLOSED with an OpenAI-shaped 401 naming the variable and Key file. A
-    deterministic Seam validation failure answers with its OpenAI-shaped status body.
+    deterministic Seam validation failure answers with its OpenAI-shaped status body. Every
+    dispatched request appends exactly one JSONL line, finalized in a try/finally.
     """
-    reader = request.app["codex_keys"]
-    key = reader.get(profile.api_key_env)
-    if not key:
-        return _openai_auth_error(profile.api_key_env, reader.path)
-
-    raw = await request.read()
+    start = time.monotonic()
+    comp = _Completion(
+        ingress="responses",
+        profile=profile.name,
+        upstream=str(relay_upstream_url(profile.base_url, "/v1/messages")),
+    )
     try:
-        payload = json.loads(raw)
-    except ValueError:
-        body = seam.openai_error_body("request body must be valid JSON", "invalid_request_error")
-        return web.json_response(body, status=400)
+        reader = request.app["codex_keys"]
+        key = reader.get(profile.api_key_env)
+        if not key:
+            comp.status = 401
+            return _openai_auth_error(profile.api_key_env, reader.path)
 
-    stream = bool(isinstance(payload, dict) and payload.get("stream"))
-    try:
-        anthropic_body, meta = seam.responses_to_anthropic(profile, payload, stream=stream)
-    except seam.SeamError as exc:
-        return web.json_response(exc.body, status=exc.status)
+        raw = await request.read()
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            comp.status = 400
+            body = seam.openai_error_body(
+                "request body must be valid JSON", "invalid_request_error"
+            )
+            return web.json_response(body, status=400)
+        if isinstance(payload, dict) and isinstance(payload.get("model"), str):
+            comp.model = payload["model"]
 
-    if stream:
-        return await _seam_stream(request, profile, key, anthropic_body, meta)
-    return await _seam_nonstream(request, profile, key, anthropic_body, meta)
+        stream = bool(isinstance(payload, dict) and payload.get("stream"))
+        try:
+            anthropic_body, meta = seam.responses_to_anthropic(profile, payload, stream=stream)
+        except seam.SeamError as exc:
+            comp.status = exc.status
+            return web.json_response(exc.body, status=exc.status)
+
+        comp.model = anthropic_body["model"]
+        if meta.stripped_tools:
+            comp.stripped_tools = list(meta.stripped_tools)
+
+        if stream:
+            return await _seam_stream(request, profile, key, anthropic_body, comp)
+        return await _seam_nonstream(request, profile, key, anthropic_body, comp)
+    finally:
+        _finalize(request, comp, start)
 
 
 def _seam_egress(request: web.Request, profile: Profile, key: str, anthropic_body: dict):
@@ -275,52 +491,65 @@ def _seam_egress(request: web.Request, profile: Profile, key: str, anthropic_bod
 
 
 async def _seam_nonstream(
-    request: web.Request, profile: Profile, key: str, anthropic_body: dict, meta: seam.SeamMeta
+    request: web.Request, profile: Profile, key: str, anthropic_body: dict, comp: _Completion
 ) -> web.StreamResponse:
-    """Forward a non-streaming Seam request and translate the complete Anthropic response."""
+    """Forward a non-streaming Seam request and translate the complete Anthropic response.
+
+    Records the upstream status and the provider usage object VERBATIM (``None`` when the
+    provider returned no usage) onto ``comp`` for the JSONL line.
+    """
     try:
         async with _seam_egress(request, profile, key, anthropic_body) as upstream:
             raw = await upstream.read()
             if upstream.status >= 400:
-                _log_seam(request, profile, meta, upstream.status, {})
+                comp.status = upstream.status
                 return web.json_response(
                     seam.anthropic_error_to_openai(raw), status=upstream.status
                 )
             try:
                 anthropic_response = json.loads(raw)
             except ValueError:
-                _log_seam(request, profile, meta, 502, {})
+                comp.status = 502
                 return web.json_response(
                     seam.openai_error_body("upstream returned malformed JSON", "api_error"),
                     status=502,
                 )
-            responses_object, usage = seam.anthropic_response_to_responses(
+            responses_object, _ = seam.anthropic_response_to_responses(
                 anthropic_response, request_model=anthropic_body["model"]
             )
-            _log_seam(request, profile, meta, upstream.status, usage)
+            comp.status = upstream.status
+            usage = anthropic_response.get("usage")
+            comp.usage = usage if isinstance(usage, dict) else None
             return web.json_response(responses_object, status=200)
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        _log_seam(request, profile, meta, 502, {})
+        comp.status = 502
         return web.json_response(
             seam.openai_error_body("upstream connection failed", "api_error"), status=502
         )
 
 
 async def _seam_stream(
-    request: web.Request, profile: Profile, key: str, anthropic_body: dict, meta: seam.SeamMeta
+    request: web.Request, profile: Profile, key: str, anthropic_body: dict, comp: _Completion
 ) -> web.StreamResponse:
-    """Forward a streaming Seam request and translate the Anthropic SSE into Responses SSE."""
+    """Forward a streaming Seam request and translate the Anthropic SSE into Responses SSE.
+
+    Usage is extracted by a passive tee over the PROVIDER-side Anthropic SSE (never the
+    client-side Responses events): every usage-carrying event is shallow-merged in arrival
+    order, so a mid-stream termination still logs the usage merged so far.
+    """
     parser = seam.AnthropicSSEParser()
     translator = seam.ResponsesStreamTranslator()
+    usage: dict | None = None
     client_response: web.StreamResponse | None = None
     try:
         async with _seam_egress(request, profile, key, anthropic_body) as upstream:
             if upstream.status >= 400:
                 raw = await upstream.read()
-                _log_seam(request, profile, meta, upstream.status, {})
+                comp.status = upstream.status
                 return web.json_response(
                     seam.anthropic_error_to_openai(raw), status=upstream.status
                 )
+            comp.status = upstream.status
             client_response = web.StreamResponse(
                 status=200,
                 headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
@@ -328,15 +557,18 @@ async def _seam_stream(
             await client_response.prepare(request)
             async for chunk in upstream.content.iter_any():
                 for event in parser.feed(chunk):
+                    part = observability.sse_event_usage(event)
+                    if part is not None:
+                        usage = {**(usage or {}), **part}
                     for out in translator.handle(event):
                         await client_response.write(seam.sse_bytes(out))
             for out in translator.finish():
                 await client_response.write(seam.sse_bytes(out))
             await client_response.write_eof()
-            _log_seam(request, profile, meta, upstream.status, translator.usage)
+            comp.usage = usage
             return client_response
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        _log_seam(request, profile, meta, 502, translator.usage)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
+        comp.usage = usage
         if client_response is not None and client_response.prepared:
             for out in translator.fail("upstream stream failed"):
                 try:
@@ -345,28 +577,10 @@ async def _seam_stream(
                     break
             await client_response.write_eof()
             return client_response
+        comp.status = 502
         return web.json_response(
             seam.openai_error_body("upstream connection failed", "api_error"), status=502
         )
-
-
-def _log_seam(
-    request: web.Request, profile: Profile, meta: seam.SeamMeta, status: int, usage: dict
-) -> None:
-    """Hand one Seam record to the injectable log sink; sink errors never fail the request."""
-    record = {
-        "ingress": "responses",
-        "profile": profile.name,
-        "upstream": profile.base_url,
-        "status": status,
-        "stripped_tools": list(meta.stripped_tools),
-        "synthesized_max_tokens": meta.synthesized_max_tokens,
-        "usage": usage,
-    }
-    try:
-        request.app["seam_log_sink"](record)
-    except Exception:  # observability must never corrupt a valid response
-        pass
 
 
 def _openai_auth_error(api_key_env: str, keys_path: object) -> web.Response:
