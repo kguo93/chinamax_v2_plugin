@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chinamaxM"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.10,<4",
+    "litellm[proxy]==1.96.2",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-aiohttp",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+chinamaxM = ["data/*.json"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
