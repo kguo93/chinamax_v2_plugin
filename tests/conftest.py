@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+from dataclasses import replace
 
 import pytest
 from aiohttp import web
@@ -185,14 +186,59 @@ class FakeProvider:
 
 
 @pytest.fixture
-async def fake_provider(aiohttp_server) -> FakeProvider:
+def make_fake_provider(aiohttp_server):
+    """Return an async factory that starts an additional recording fake upstream."""
+
+    async def _make() -> FakeProvider:
+        fake = FakeProvider()
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", fake._handle)
+        server = await aiohttp_server(app)
+        fake.url = str(server.make_url("/")).rstrip("/")
+        return fake
+
+    return _make
+
+
+@pytest.fixture
+async def fake_provider(make_fake_provider) -> FakeProvider:
     """Start the recording fake upstream and return its handle."""
-    fake = FakeProvider()
-    app = web.Application()
-    app.router.add_route("*", "/{tail:.*}", fake._handle)
-    server = await aiohttp_server(app)
-    fake.url = str(server.make_url("/")).rstrip("/")
-    return fake
+    return await make_fake_provider()
+
+
+# ------------------------------------------------------------------------- Key files
+
+
+class HostHome:
+    """A temp Host root with helpers to write and mutate its Key file (ADR 0006)."""
+
+    def __init__(self, root) -> None:
+        self.root = root
+        self.keys_path = root / "model-keys.env"
+
+    def write_keys(self, mapping: dict[str, str]) -> None:
+        """Write a ``VAR=value`` Key file from a mapping (one line per entry)."""
+        self.write_text("".join(f"{name}={value}\n" for name, value in mapping.items()))
+
+    def write_text(self, text: str) -> None:
+        """Write raw text as the Key file."""
+        self.keys_path.write_text(text, encoding="utf-8")
+
+
+@pytest.fixture
+def claude_home(tmp_path) -> HostHome:
+    """A created, empty Claude Host root for injecting Key files into relay tests."""
+    home = HostHome(tmp_path / "claude-home")
+    home.root.mkdir()
+    return home
+
+
+@pytest.fixture
+def codex_home(tmp_path) -> HostHome:
+    """A created, empty Codex Host root (proves ingress→file selection in relay tests)."""
+    home = HostHome(tmp_path / "codex-home")
+    home.root.mkdir()
+    return home
 
 
 # ------------------------------------------------------------------------- proxy app
@@ -202,13 +248,40 @@ async def fake_provider(aiohttp_server) -> FakeProvider:
 def make_proxy(aiohttp_client, fake_provider):
     """Return an async factory building a proxy TestClient over the fake upstream."""
 
-    async def _make(registry: Registry | None = None, *, routing_debug: bool = False):
+    async def _make(
+        registry: Registry | None = None,
+        *,
+        routing_debug: bool = False,
+        claude_home: str | None = None,
+        codex_home: str | None = None,
+    ):
         if registry is None:
             registry = load_registry()
-        app = create_app(registry, upstream_base=fake_provider.url, routing_debug=routing_debug)
+        app = create_app(
+            registry,
+            upstream_base=fake_provider.url,
+            routing_debug=routing_debug,
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
         return await aiohttp_client(app)
 
     return _make
+
+
+@pytest.fixture
+def relay_registry(fake_provider):
+    """The shipped Registry with every Profile's ``base_url`` pointed at the fake upstream.
+
+    Relay forwarding targets ``profile.base_url``, so the seed endpoints (real, non-loopback)
+    are rewritten to the fake provider — otherwise the loopback socket guard would fire.
+    """
+    base = load_registry()
+    profiles = {
+        name: replace(profile, base_url=fake_provider.url)
+        for name, profile in base.profiles.items()
+    }
+    return Registry(port=base.port, profiles=profiles)
 
 
 @pytest.fixture
