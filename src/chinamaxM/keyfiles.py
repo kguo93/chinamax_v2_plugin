@@ -37,11 +37,11 @@ def resolve_host_root(
         return Path(override)
     if host == "claude":
         env = os.environ.get("CHINAMAXM_CLAUDE_HOME") or os.environ.get("CLAUDE_CONFIG_DIR")
-        default = os.path.expanduser("~/.claude")
+        default = "~/.claude"
     else:
         env = os.environ.get("CHINAMAXM_CODEX_HOME") or os.environ.get("CODEX_HOME")
-        default = os.path.expanduser("~/.codex")
-    return Path(env or default)
+        default = "~/.codex"
+    return Path(env or os.path.expanduser(default))
 
 
 def _parse_key_file(text: str) -> dict[str, str]:

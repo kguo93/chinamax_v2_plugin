@@ -9,6 +9,8 @@ requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.10,<4",
     "litellm[proxy]==1.96.2",
+    "tomlkit>=0.13,<1",
+    "PyYAML>=6,<7",
 ]
 
 [project.optional-dependencies]
