@@ -1,0 +1,5 @@
+{
+  "name": "chinamaxM",
+  "hooks": "./hooks/codex-hooks.json",
+  "skills": "./skills"
+}

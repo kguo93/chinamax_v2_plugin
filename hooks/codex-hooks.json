@@ -1,0 +1,30 @@
+{
+  "description": "chinamaxM Codex worker-contract hooks (ADR 0005/0007). SubagentStart injects the numbered Worker contract (complete-final-report duty) into a spawned chinamaxM Worker role; PreToolUse(spawn_agent) injects the verbatim no-attribution Relay rule into the dispatching parent. The adapter shim translates the Codex payload (tool_name spawn_agent -> Agent; tool_input.agent_type -> subagent_type) and reuses the shared worker_contract module, whose matching is anchored and Registry-derived in Python — SubagentStart carries NO static matcher because Overlay Profiles are dynamic, so the script does the anchored match. PreToolUse matches spawn_agent ONLY (never Bash) to avoid taxing every shell call. Both fail open (exit 0, no injection) on any internal fault. commandWindows enters Git Bash so the POSIX shim runs unchanged.",
+  "hooks": {
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/scripts/codex_worker_contract_hook\"",
+            "commandWindows": "cmd /d /c \"\"%PLUGIN_ROOT%\\scripts\\codex_hook_bash.cmd\" codex_worker_contract_hook\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "spawn_agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/scripts/codex_worker_contract_hook\"",
+            "commandWindows": "cmd /d /c \"\"%PLUGIN_ROOT%\\scripts\\codex_hook_bash.cmd\" codex_worker_contract_hook\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
