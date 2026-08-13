@@ -277,22 +277,25 @@ def test_steer_documented_no_resume_machinery():
 
 
 def test_hooks_registered():
-    """AC-6: hooks.json registers the two events with exact matcher/timeout and live shims."""
+    """AC-6 (+ hosts-04): hooks.json registers all three events with exact matcher/timeout
+    and live shims; hosts-04's SessionStart entry is additive and preserves hosts-02's."""
     hooks = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
     events = set(hooks["hooks"])
     assert events <= _EVENT_ALLOWLIST, events
-    assert {"SubagentStart", "PreToolUse"} <= events
+    # hosts-02's two entries are preserved alongside hosts-04's additive SessionStart entry.
+    assert {"SubagentStart", "PreToolUse", "SessionStart"} <= events
 
     # SubagentStart carries NO static matcher (Overlay Profiles are dynamic).
     subagent_group = hooks["hooks"]["SubagentStart"][0]
     assert "matcher" not in subagent_group
 
-    # PreToolUse's matcher is exactly "Agent".
+    # PreToolUse's matcher is exactly "Agent"; SessionStart's is the pinned event list.
     assert hooks["hooks"]["PreToolUse"][0]["matcher"] == "Agent"
+    assert hooks["hooks"]["SessionStart"][0]["matcher"] == "startup|resume|clear|compact|fork"
 
-    # Both entries pin timeout 10; every referenced script exists, is executable, and
+    # Every entry pins timeout 10; every referenced script exists, is executable, and
     # resolves after plugin-root expansion.
-    for event_name in ("SubagentStart", "PreToolUse"):
+    for event_name in ("SubagentStart", "PreToolUse", "SessionStart"):
         for group in hooks["hooks"][event_name]:
             for hook in group["hooks"]:
                 assert hook["type"] == "command"
