@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Worker-contract hook shim (ADR 0005/0007): buffer stdin, resolve the interpreter by the
+# PINNED order, and run the module, which branches on the stdin hook_event_name. Registered
+# for SubagentStart (no matcher) and PreToolUse(Agent) in hooks/hooks.json.
+#
+# Interpreter resolution is PINNED and never probed beyond this order — the first is used:
+#   1) $CHINAMAXM_PYTHON                 (an absolute executable python)
+#   2) the setup-recorded python-path    (<claude-root>/chinamaxM/python-path)
+#   3) conda run -n chinamaxM python      (last resort — costs seconds per spawn)
+# There is no `set -e`: the module always exits 0, and the shim exits 0 unconditionally so
+# a hook fault can never block a tool call (fail-open).
+set -uo pipefail
+
+MODULE="chinamaxM.hooks.worker_contract"
+payload="$(cat)"
+
+# Rungs 1-2: print an absolute executable python, or return 1 to fall through to conda.
+resolve_python() {
+  if [ -n "${CHINAMAXM_PYTHON:-}" ] && [ -x "${CHINAMAXM_PYTHON}" ]; then
+    printf '%s\n' "${CHINAMAXM_PYTHON}"
+    return 0
+  fi
+  local claude_root recorded_file recorded
+  claude_root="${CHINAMAXM_CLAUDE_HOME:-${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}}"
+  recorded_file="${claude_root}/chinamaxM/python-path"
+  if [ -f "${recorded_file}" ]; then
+    recorded="$(head -n1 "${recorded_file}" 2>/dev/null | tr -d '\r\n')"
+    if [ -n "${recorded}" ] && [ -x "${recorded}" ]; then
+      printf '%s\n' "${recorded}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+if py="$(resolve_python)"; then
+  printf '%s' "${payload}" | "${py}" -m "${MODULE}"
+  exit 0
+fi
+
+if command -v conda >/dev/null 2>&1; then
+  # `--no-capture-output` is REQUIRED: plain `conda run` swallows stdin, so the module
+  # would read an empty event and inject nothing. It connects stdio directly instead.
+  printf '%s' "${payload}" | conda run --no-capture-output -n chinamaxM python -m "${MODULE}"
+  exit 0
+fi
+
+echo "chinamaxM worker_contract_hook: no interpreter resolved (set CHINAMAXM_PYTHON, record a python-path, or create the chinamaxM conda env)" >&2
+exit 0

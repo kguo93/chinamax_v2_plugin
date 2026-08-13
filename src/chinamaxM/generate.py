@@ -28,7 +28,7 @@ import stat
 import tempfile
 import tomllib
 from pathlib import Path
-from typing import Literal, Mapping
+from typing import Iterable, Literal, Mapping
 
 import tomlkit
 import yaml
@@ -254,6 +254,41 @@ def expected_providers(registry: Registry) -> dict[str, dict[str, str]]:
         _provider_id(profile.name): _provider_fields(profile, port)
         for profile in registry.profiles.values()
     }
+
+
+# ---------------------------------------------------------------- agent-name matching
+
+
+def matches_generated_agent(name: str, profile_names: Iterable[str]) -> bool:
+    """Return whether ``name`` addresses a generated Worker for some Profile.
+
+    A generated Worker is spawned either as the bare Profile agent (its ``agent_type`` is
+    the Profile name) or under an operator-chosen name ``<profile>-<suffix>`` with a
+    non-empty suffix (a named spawn surfaces the NAME, not the subagent type — ADR 0004 as
+    amended). This is the single shared matcher the worker-contract hook reuses on both its
+    SubagentStart (``agent_type``) and PreToolUse (``subagent_type``) branches, so the rule
+    is never re-implemented inline.
+
+    Matching is anchored and case-sensitive: a bare substring would misfire (``glm`` inside
+    ``glmax``, ``kimi`` inside ``akimi``). Reserved Profile names cannot enter the Registry
+    (ADR 0003/0004 as amended), so a built-in agent name can never match. An unrelated
+    agent whose name merely starts ``<profile>-`` gets the benign contract — the accepted
+    false-positive direction.
+
+    Args:
+        name: The candidate ``agent_type`` or ``subagent_type`` from a hook event.
+        profile_names: The resolved Registry's Profile names.
+
+    Returns:
+        ``True`` when ``name`` equals a Profile name or ``<profile>-<non-empty suffix>``.
+    """
+    for profile in profile_names:
+        if name == profile:
+            return True
+        prefix = f"{profile}-"
+        if name.startswith(prefix) and len(name) > len(prefix):
+            return True
+    return False
 
 
 # ------------------------------------------------------------------- marker helpers

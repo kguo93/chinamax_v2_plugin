@@ -1,0 +1,28 @@
+{
+  "description": "chinamaxM Claude worker-contract hooks (ADR 0005/0007). SubagentStart injects the numbered Worker contract (complete-final-report duty) into a spawned chinamaxM Worker; PreToolUse(Agent) injects the verbatim no-attribution Relay rule into the dispatching parent. Matching is anchored and Registry-derived in Python — SubagentStart carries NO static matcher because Overlay Profiles are dynamic. Both fail open (exit 0, no injection) on any internal fault. Entries are additive; hosts-04 appends its SessionStart entry to this same file.",
+  "hooks": {
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/worker_contract_hook\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/worker_contract_hook\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
