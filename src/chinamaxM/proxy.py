@@ -1,12 +1,20 @@
-"""The local reverse Proxy: Anthropic ingress, Profile-prefix router, Default + Relay.
+"""The local reverse Proxy: Anthropic + Responses ingresses, router, Default + Relay + Seam.
 
 A prefixless request rides the Default branch (byte-for-byte passthrough to
 api.anthropic.com — ADR 0001 as amended). A ``<profile>/<model>`` prefix naming an
 Anthropic-dialect Profile rides the Relay branch (prefix stripped, auth swapped, Scrub,
 thinking normalization, extras merged — ADRs 0001/0003/0006; see :mod:`chinamaxM.relay`);
-a ``responses``-dialect Profile still answers 501 (proxy-03), as does a prefixed
-count_tokens (proxy-04). A slash-prefixed unknown profile answers a local 404 naming the
-valid Profile list; every other path and method passes through unconditionally, streamed.
+a ``responses``-dialect Profile still answers 501 on the Anthropic ingress, as does a
+prefixed count_tokens (proxy-04). A slash-prefixed unknown profile answers a local 404
+naming the valid Profile list; every other path and method passes through unconditionally,
+streamed.
+
+The Responses ingress ``POST /openai/<profile>/responses`` crosses the LiteLLM Seam
+(:mod:`chinamaxM.seam`): the Codex Responses request is translated to an Anthropic Messages
+egress body (key injected from the Codex Key file), forwarded with the relay machinery, and
+the provider's Anthropic response/SSE is translated back to a Responses event sequence. An
+unknown profile ⇒ 404 with the valid list, a ``responses``-dialect Profile ⇒ 501, and any
+other method or path under ``/openai/…`` ⇒ the same 404 — never the Default branch.
 
 Per-Host Key files are scaffolded at startup (:mod:`chinamaxM.keyfiles`): the Claude file
 always, the Codex file only when its resolved root already exists.
@@ -25,9 +33,15 @@ import yarl
 from aiohttp import web
 from multidict import CIMultiDict
 
+from chinamaxM import seam
 from chinamaxM.keyfiles import KEY_FILE_NAME, KeyFileReader, resolve_host_root, scaffold_key_file
 from chinamaxM.registry import Profile, Registry, load_registry
-from chinamaxM.relay import forward_relay
+from chinamaxM.relay import (
+    forward_relay,
+    make_relay_request_headers,
+    relay_upstream_url,
+    serialize_body,
+)
 
 #: Loopback bind address — the Proxy is never exposed off-host (ADR 0001).
 LOOPBACK_HOST = "127.0.0.1"
@@ -68,6 +82,7 @@ def create_app(
     routing_debug: bool = False,
     claude_home: str | None = None,
     codex_home: str | None = None,
+    log_sink: object = None,
 ) -> web.Application:
     """Build the Proxy application from an already-loaded Registry.
 
@@ -80,6 +95,9 @@ def create_app(
         claude_home: An explicit Claude Host root that wins over the environment chain
             (ADR 0006 as amended); tests inject a temp root here.
         codex_home: An explicit Codex Host root, resolved the same way.
+        log_sink: An injectable callable receiving one Seam record dict per Responses
+            request (proxy-04 plugs in the JSONL writer); ``None`` means a no-op. Sink
+            exceptions are always caught so observability never fails a valid response.
 
     Returns:
         The configured, unstarted aiohttp application.
@@ -91,10 +109,13 @@ def create_app(
     app["claude_root"] = resolve_host_root("claude", claude_home)
     app["codex_root"] = resolve_host_root("codex", codex_home)
     app["claude_keys"] = KeyFileReader(app["claude_root"] / KEY_FILE_NAME)
+    app["codex_keys"] = KeyFileReader(app["codex_root"] / KEY_FILE_NAME)
+    app["seam_log_sink"] = log_sink if callable(log_sink) else (lambda record: None)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     app.router.add_post("/v1/messages", _messages_handler)
     app.router.add_post("/v1/messages/count_tokens", _count_tokens_handler)
+    app.router.add_route("*", "/openai/{tail:.*}", _openai_handler)
     app.router.add_route("*", "/{tail:.*}", _default_handler)
     return app
 
@@ -179,6 +200,181 @@ async def _relay(request: web.Request, body: bytes, profile: Profile) -> web.Str
     return await forward_relay(
         request, body, profile, key, request.app["session"], "/v1/messages"
     )
+
+
+async def _openai_handler(request: web.Request) -> web.StreamResponse:
+    """Route the Responses ingress; only POST ``/openai/<profile>/responses`` is served.
+
+    An unknown profile ⇒ 404 with the valid list; a ``responses``-dialect Profile ⇒ 501; any
+    other method or path under ``/openai/…`` ⇒ the same local 404 — never the Default branch.
+
+    Returns:
+        The translated Responses answer, a local 404, a 501, or an OpenAI-shaped 401.
+    """
+    registry = request.app["registry"]
+    tail = request.match_info["tail"]
+    parts = tail.split("/")
+    if request.method != "POST" or len(parts) != 2 or parts[1] != "responses":
+        return _unknown_profile_response(registry)
+    profile = registry.profiles.get(parts[0])
+    if profile is None:
+        return _unknown_profile_response(registry)
+    if profile.dialect != "anthropic":
+        return _not_implemented_response(
+            "responses-dialect relay not yet implemented", profile, request.app["routing_debug"]
+        )
+    return await _seam_dispatch(request, profile)
+
+
+async def _seam_dispatch(request: web.Request, profile: Profile) -> web.StreamResponse:
+    """Translate one Responses request across the Seam and forward it to the provider.
+
+    Injects the Profile key from the Codex Key file (Responses ingress → Codex file); a
+    missing key fails CLOSED with an OpenAI-shaped 401 naming the variable and Key file. A
+    deterministic Seam validation failure answers with its OpenAI-shaped status body.
+    """
+    reader = request.app["codex_keys"]
+    key = reader.get(profile.api_key_env)
+    if not key:
+        return _openai_auth_error(profile.api_key_env, reader.path)
+
+    raw = await request.read()
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        body = seam.openai_error_body("request body must be valid JSON", "invalid_request_error")
+        return web.json_response(body, status=400)
+
+    stream = bool(isinstance(payload, dict) and payload.get("stream"))
+    try:
+        anthropic_body, meta = seam.responses_to_anthropic(profile, payload, stream=stream)
+    except seam.SeamError as exc:
+        return web.json_response(exc.body, status=exc.status)
+
+    if stream:
+        return await _seam_stream(request, profile, key, anthropic_body, meta)
+    return await _seam_nonstream(request, profile, key, anthropic_body, meta)
+
+
+def _seam_egress(request: web.Request, profile: Profile, key: str, anthropic_body: dict):
+    """Open the Seam egress request context to the Profile's Anthropic endpoint."""
+    session: aiohttp.ClientSession = request.app["session"]
+    url = relay_upstream_url(profile.base_url, "/v1/messages")
+    headers = make_relay_request_headers(request.headers, key)
+    timeout = aiohttp.ClientTimeout(
+        total=None, connect=30, sock_read=seam.UPSTREAM_READ_TIMEOUT
+    )
+    return session.request(
+        "POST",
+        url,
+        headers=headers,
+        data=serialize_body(anthropic_body),
+        allow_redirects=False,
+        timeout=timeout,
+    )
+
+
+async def _seam_nonstream(
+    request: web.Request, profile: Profile, key: str, anthropic_body: dict, meta: seam.SeamMeta
+) -> web.StreamResponse:
+    """Forward a non-streaming Seam request and translate the complete Anthropic response."""
+    try:
+        async with _seam_egress(request, profile, key, anthropic_body) as upstream:
+            raw = await upstream.read()
+            if upstream.status >= 400:
+                _log_seam(request, profile, meta, upstream.status, {})
+                return web.json_response(
+                    seam.anthropic_error_to_openai(raw), status=upstream.status
+                )
+            try:
+                anthropic_response = json.loads(raw)
+            except ValueError:
+                _log_seam(request, profile, meta, 502, {})
+                return web.json_response(
+                    seam.openai_error_body("upstream returned malformed JSON", "api_error"),
+                    status=502,
+                )
+            responses_object, usage = seam.anthropic_response_to_responses(
+                anthropic_response, request_model=anthropic_body["model"]
+            )
+            _log_seam(request, profile, meta, upstream.status, usage)
+            return web.json_response(responses_object, status=200)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        _log_seam(request, profile, meta, 502, {})
+        return web.json_response(
+            seam.openai_error_body("upstream connection failed", "api_error"), status=502
+        )
+
+
+async def _seam_stream(
+    request: web.Request, profile: Profile, key: str, anthropic_body: dict, meta: seam.SeamMeta
+) -> web.StreamResponse:
+    """Forward a streaming Seam request and translate the Anthropic SSE into Responses SSE."""
+    parser = seam.AnthropicSSEParser()
+    translator = seam.ResponsesStreamTranslator()
+    client_response: web.StreamResponse | None = None
+    try:
+        async with _seam_egress(request, profile, key, anthropic_body) as upstream:
+            if upstream.status >= 400:
+                raw = await upstream.read()
+                _log_seam(request, profile, meta, upstream.status, {})
+                return web.json_response(
+                    seam.anthropic_error_to_openai(raw), status=upstream.status
+                )
+            client_response = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+            )
+            await client_response.prepare(request)
+            async for chunk in upstream.content.iter_any():
+                for event in parser.feed(chunk):
+                    for out in translator.handle(event):
+                        await client_response.write(seam.sse_bytes(out))
+            for out in translator.finish():
+                await client_response.write(seam.sse_bytes(out))
+            await client_response.write_eof()
+            _log_seam(request, profile, meta, upstream.status, translator.usage)
+            return client_response
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        _log_seam(request, profile, meta, 502, translator.usage)
+        if client_response is not None and client_response.prepared:
+            for out in translator.fail("upstream stream failed"):
+                try:
+                    await client_response.write(seam.sse_bytes(out))
+                except (aiohttp.ClientError, ConnectionError):
+                    break
+            await client_response.write_eof()
+            return client_response
+        return web.json_response(
+            seam.openai_error_body("upstream connection failed", "api_error"), status=502
+        )
+
+
+def _log_seam(
+    request: web.Request, profile: Profile, meta: seam.SeamMeta, status: int, usage: dict
+) -> None:
+    """Hand one Seam record to the injectable log sink; sink errors never fail the request."""
+    record = {
+        "ingress": "responses",
+        "profile": profile.name,
+        "upstream": profile.base_url,
+        "status": status,
+        "stripped_tools": list(meta.stripped_tools),
+        "synthesized_max_tokens": meta.synthesized_max_tokens,
+        "usage": usage,
+    }
+    try:
+        request.app["seam_log_sink"](record)
+    except Exception:  # observability must never corrupt a valid response
+        pass
+
+
+def _openai_auth_error(api_key_env: str, keys_path: object) -> web.Response:
+    """Return the OpenAI-shaped 401 for a missing Codex Key, naming the variable and file."""
+    body = seam.openai_error_body(
+        f"{api_key_env} missing in {keys_path}", "authentication_error"
+    )
+    return web.json_response(body, status=401)
 
 
 async def _default_handler(request: web.Request) -> web.StreamResponse:

@@ -10,6 +10,7 @@ connects beyond ``127.0.0.1``/``::1``/``localhost``.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 from dataclasses import replace
@@ -129,12 +130,14 @@ class FakeProvider:
 
     def __init__(self) -> None:
         self.requests: list[RecordedRequest] = []
+        self.chat_completions_hits: list[str] = []
         self.url = ""
         self._mode = "response"
         self._status = 200
         self._headers: CIMultiDict = CIMultiDict()
         self._body: bytes = b""
         self._chunks: list[bytes] = []
+        self._gated = True
         self._gates: list[asyncio.Event] = []
         self._written: list[asyncio.Event] = []
 
@@ -148,13 +151,23 @@ class FakeProvider:
         self._body = body
 
     def respond_stream(
-        self, chunks: list[bytes], *, status: int = 200, headers: dict | None = None
+        self,
+        chunks: list[bytes],
+        *,
+        status: int = 200,
+        headers: dict | None = None,
+        gated: bool = True,
     ) -> None:
-        """Script a gated SSE response; use :meth:`release` to advance chunk by chunk."""
+        """Script an SSE response; when ``gated`` use :meth:`release` to advance chunk by chunk.
+
+        ``gated=False`` writes every chunk immediately (for Seam tests that read the whole
+        translated stream, where per-chunk gating would deadlock the reader).
+        """
         self._mode = "stream"
         self._status = status
         self._headers = CIMultiDict(headers or {})
         self._chunks = list(chunks)
+        self._gated = gated
         self._gates = [asyncio.Event() for _ in chunks]
         self._written = [asyncio.Event() for _ in chunks]
 
@@ -171,6 +184,11 @@ class FakeProvider:
         self.requests.append(
             RecordedRequest(request.method, request.raw_path, request.headers.copy(), body)
         )
+        if "chat/completions" in request.raw_path:
+            # ADR 0002: chat-completions egress is banned; the fixture refuses it so any
+            # Seam degradation to that wire path fails loudly (proxy-03 test 8).
+            self.chat_completions_hits.append(request.raw_path)
+            return web.Response(status=400, body=b"chat-completions egress is banned")
         if self._mode == "response":
             return web.Response(status=self._status, headers=self._headers, body=self._body)
 
@@ -179,7 +197,7 @@ class FakeProvider:
         for index, chunk in enumerate(self._chunks):
             await response.write(chunk)
             self._written[index].set()
-            if index < len(self._chunks) - 1:
+            if self._gated and index < len(self._chunks) - 1:
                 await asyncio.wait_for(self._gates[index].wait(), timeout=10.0)
         await response.write_eof()
         return response
@@ -254,6 +272,7 @@ def make_proxy(aiohttp_client, fake_provider):
         routing_debug: bool = False,
         claude_home: str | None = None,
         codex_home: str | None = None,
+        log_sink: object = None,
     ):
         if registry is None:
             registry = load_registry()
@@ -263,6 +282,7 @@ def make_proxy(aiohttp_client, fake_provider):
             routing_debug=routing_debug,
             claude_home=claude_home,
             codex_home=codex_home,
+            log_sink=log_sink,
         )
         return await aiohttp_client(app)
 
@@ -288,3 +308,78 @@ def relay_registry(fake_provider):
 async def proxy_client(make_proxy):
     """A proxy TestClient over the shipped Registry (no routing debug)."""
     return await make_proxy()
+
+
+# ------------------------------------------------------------- Responses Seam (proxy-03)
+
+
+def parse_responses_sse(text: str) -> list[dict]:
+    """Parse a Responses SSE payload (``event:``/``data:`` frames) into event dicts."""
+    events: list[dict] = []
+    for block in text.replace("\r\n", "\n").split("\n\n"):
+        data_lines = [
+            line[len("data:"):].lstrip()
+            for line in block.split("\n")
+            if line.startswith("data:")
+        ]
+        if data_lines:
+            events.append(json.loads("\n".join(data_lines)))
+    return events
+
+
+class FakeCodexClient:
+    """A fake Codex Responses client driving the Responses ingress of a proxy TestClient."""
+
+    def __init__(self, client, profile_name: str) -> None:
+        self._client = client
+        self.path = f"/openai/{profile_name}/responses"
+
+    async def send(self, body: dict):
+        """POST a non-streaming Responses request; return the aiohttp client response."""
+        return await self._client.post(self.path, json=body)
+
+    async def send_streaming(self, body: dict) -> list[dict]:
+        """POST a streaming Responses request; return the parsed Responses event sequence."""
+        response = await self._client.post(self.path, json={**body, "stream": True})
+        assert response.status == 200, await response.text()
+        text = await response.text()
+        return parse_responses_sse(text)
+
+    async def stream_response(self, body: dict):
+        """POST a streaming Responses request; return the raw response (for status checks)."""
+        return await self._client.post(self.path, json={**body, "stream": True})
+
+
+@pytest.fixture
+def make_seam_client(make_proxy, relay_registry, codex_home, fake_provider):
+    """Return a factory building a fake Codex client over a Seam-configured proxy.
+
+    The proxy routes every Profile's ``base_url`` at the shared fake provider (relay
+    registry) and reads the Codex Key file from a temp Codex Host root.
+    """
+
+    async def _make(profile_name: str = "glm", *, keys: dict | None = None, log_sink=None):
+        profile = relay_registry.profiles[profile_name]
+        codex_home.write_keys(keys or {profile.api_key_env: "sk-codex-value"})
+        client = await make_proxy(
+            relay_registry, codex_home=str(codex_home.root), log_sink=log_sink
+        )
+        return FakeCodexClient(client, profile_name), fake_provider
+
+    return _make
+
+
+@pytest.fixture(autouse=True)
+def _ban_litellm_transport(monkeypatch):
+    """Tripwire: make the four banned litellm transport entry points raise if ever called.
+
+    Product code must never invoke ``litellm.responses``/``aresponses``/
+    ``anthropic_messages``/``acompletion`` (ADR 0002); the Seam uses pure transforms only.
+    """
+    import litellm
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("banned litellm transport entry point was invoked")
+
+    for name in ("responses", "aresponses", "anthropic_messages", "acompletion"):
+        monkeypatch.setattr(litellm, name, _forbidden, raising=False)

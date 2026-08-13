@@ -225,3 +225,17 @@ def _upstream_failed_response() -> web.Response:
     """Return the pinned 502 for an upstream connection failure on the relay branch."""
     body = {"error": {"type": "api_error", "message": "upstream connection failed"}}
     return web.json_response(body, status=502)
+
+
+def make_relay_request_headers(inbound: CIMultiDict, key: str) -> CIMultiDict:
+    """Build the relay egress headers (auth swapped, version defaulted, identity encoding).
+
+    A public alias over the relay branch's header policy so the Responses Seam egress
+    (proxy-03) reuses the exact same auth-swap / hop-by-hop handling instead of a third copy.
+    """
+    return _relay_request_headers(inbound, key)
+
+
+def relay_upstream_url(base_url: str, upstream_path: str) -> yarl.URL:
+    """Join a Profile ``base_url`` with an upstream path (public alias reused by proxy-03)."""
+    return _relay_url(base_url, upstream_path)
