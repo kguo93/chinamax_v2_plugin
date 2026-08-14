@@ -10,3 +10,7 @@ Hook gotcha: this repo's PreToolUse hook blocks all file reads/writes until
 is edited (re-read it before the next write). `docs/CLAUDE.md` must always remain a
 readable FILE — if it is missing or a directory, every file operation deadlocks with no
 self-explanatory error (it was an accidental empty directory on 2026-08-13).
+
+Always bump the plugin version for both claude and codex manifests upon any new major feature or functionality or code change
+
+Update README whenever the plugin version changes
