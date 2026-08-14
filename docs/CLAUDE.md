@@ -38,7 +38,7 @@ exists is the product code + active manifests; until then it is these ADRs.
 | API keys: per-host model-keys.env files, proxy-side injection, scaffolding | **0006** |
 | Result relay + steering: worker contract hooks, verbatim no-attribution relay, Codex parent-mediated steer | **0007** |
 | Worker resume: live-session continuity, out-of-scope dead-session recovery, Codex thread re-attach | **0008** |
-| Proxy supervision on Linux/macOS/Windows: systemd/launchd/WinSW, self-healing | **0009** |
+| Proxy supervision on Linux/macOS/Windows: systemd/launchd/WinSW, self-healing, conda env bootstrap (Miniconda auto-install) | **0009** |
 | Observability: JSONL request log, usage/cache accounting, count_tokens fallback | **0010** |
 | Tests: hermetic fake providers, real-litellm-in-loop, prefix-stability byte tests | **0011** |
 | Distribution: GitHub canonical source, dual-manifest sync, versioning, rpi4 git-only backup | **0012** |

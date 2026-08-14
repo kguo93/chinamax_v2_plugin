@@ -55,3 +55,28 @@ password (read once from the file, applied via `sc.exe config … password=`, ne
 never serialized into the XML — unchanged from the 2026-08-13 amendment). Auto-download needs
 network at apply; `--winsw-exe` is the offline escape hatch. This Windows path is
 mocked-tested only — it is NOT live-verified on a real Windows host in this build.
+
+**Amended 2026-08-14 (setup auto-bootstraps Miniconda on all three OSes; reverses the
+gated-prerequisite stance).** The original decision above — "The conda env (`chinamaxM`,
+Python 3.12, aiohttp + pinned litellm) is a gated prerequisite exactly like the old doctor's
+miniconda Phase A machinery, whose PATTERN is reused (the old repo is a separate checkout — no
+cross-repo code import)." — is **reversed** for the conda-absent case: `/setup` now INSTALLS
+Miniconda when `conda` is absent instead of gate-failing with "install it yourself, then
+re-run". Per-OS mechanics (ported verbatim from the old plugin's `doctor`): POSIX downloads the
+official installer with `curl` and runs `bash …/.chinamaxM-miniconda.sh -b -u -p ~/miniconda3`
+(`-b -u` reuses an existing `~/miniconda3`, so a re-run is idempotent — the same `~/miniconda3`
+probe that resolves a pre-existing anaconda/miniforge conda); Windows runs the `.exe`
+JustMe/silent installer (`/InstallationType=JustMe /RegisterPython=0 /AddToPath=0 /S
+/D=%USERPROFILE%\miniconda3`, x86_64 asset). Both then run `conda init` (`bash` on Linux; `bash
+zsh` on macOS; `cmd.exe powershell bash` on Windows), which EDITS the operator's shell startup
+files — disclosed in the plan step title and the setup docs. The installer is
+`Miniconda3-latest-*` with **NO version pin and NO checksum** — an explicit inheritance of the
+old plugin's accepted tradeoff, and a deliberate divergence from this repo's pinned + SHA-256
+WinSW acquisition (see the amendment above). The bootstrap runs as a normal digest-bound,
+consent-gated apply step (its URL + argv commands ride the descriptor, so the digest binds the
+exact download), and it resolves conda by absolute path so the same apply pass can create the
+env and pip-install into it. A POSIX machine on a CPU architecture absent from the arch map
+falls back to an advice-only gate (no URL); Windows never gate-fails on arch (always the x86_64
+asset). Like the WinSW path, the Windows bootstrap is mocked-tested only — NOT live-verified on
+a real Windows host in this build (`start /wait` may not propagate the installer's exit code to
+`%ERRORLEVEL%`).

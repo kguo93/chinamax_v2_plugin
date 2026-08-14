@@ -25,6 +25,8 @@ import argparse
 import hashlib
 import json
 import os
+import platform as platform_mod
+import shutil
 import subprocess
 import sys
 import time
@@ -46,6 +48,17 @@ CONDA_ENV = "chinamaxM"
 PY_VERSION = "3.12"
 _LITELLM_PIN = "litellm[proxy]==1.96.2"
 
+#: Miniconda bootstrap source — ``latest`` over HTTPS, NO version pin and NO checksum
+#: (ADR 0009 as amended). This inherits the OLD plugin's accepted tradeoff verbatim and is a
+#: deliberate divergence from this repo's pinned + SHA-256 WinSW acquisition. One installer
+#: per (Platform, normalized arch); Windows always uses the x86_64 asset.
+_MINICONDA_URL_BASE = "https://repo.anaconda.com/miniconda/"
+#: platform.machine() normalization (matched on ``machine.lower()``): any value absent from
+#: the Platform's map is an unsupported architecture → an advice-only gate (never a 404-bound
+#: URL). Windows never gate-fails on arch.
+_LINUX_MINICONDA_ARCH = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}
+_DARWIN_MINICONDA_ARCH = {"arm64": "arm64", "x86_64": "x86_64"}
+
 #: The Proxy service entry (argv after the env Python) — ADR 0009.
 PROXY_ENTRY = ("-m", "chinamaxM.proxy")
 
@@ -61,6 +74,10 @@ _CONDA_CREATE_TIMEOUT = 900.0
 _PIP_TIMEOUT = 900.0
 _GENERATE_TIMEOUT = 180.0
 _CODEX_TIMEOUT = 60.0
+# Miniconda bootstrap timeouts (download / silent install / conda init).
+_MINICONDA_DL_TIMEOUT = 300.0
+_MINICONDA_INSTALL_TIMEOUT = 900.0
+_CONDA_INIT_TIMEOUT = 120.0
 
 # Readiness poll (a cold litellm import routinely exceeds 5s — deadline 30s, backoff).
 _READINESS_DEADLINE = 30.0
@@ -204,10 +221,44 @@ def _default_run(
 
 
 class _SubprocessConda:
-    """The default conda seam: every conda action goes through the injected runner."""
+    """The default conda seam: every conda action goes through the injected runner.
 
-    def __init__(self, run: Callable[..., subprocess.CompletedProcess[str]]) -> None:
+    ``conda`` is resolved by ABSOLUTE PATH (``~/miniconda3`` first, then ``shutil.which``) so a
+    just-bootstrapped ``~/miniconda3`` is picked up within the same apply pass and a pre-existing
+    anaconda/miniforge conda on PATH still counts. Not memoized — post-bootstrap resolution must
+    be able to flip within one process (ported from the old plugin's ``doctor._find_conda``).
+    """
+
+    def __init__(
+        self,
+        run: Callable[..., subprocess.CompletedProcess[str]],
+        *,
+        home: Path,
+        platform: str,
+    ) -> None:
         self._run = run
+        self._home = home
+        self._platform = platform
+
+    def _conda_bin(self) -> str | None:
+        """Absolute conda launcher (``~/miniconda3`` first, PATH fallback); None when absent."""
+        base = self._home / "miniconda3"
+        if self._platform.startswith("win"):
+            candidates = [base / "Scripts" / "conda.exe", base / "condabin" / "conda.bat"]
+        else:
+            candidates = [base / "bin" / "conda"]
+        for candidate in candidates:
+            if self._is_conda_executable(candidate):
+                return str(candidate)
+        return shutil.which("conda")
+
+    def _is_conda_executable(self, path: Path) -> bool:
+        """Whether ``path`` is an existing executable, keyed on the injected Platform."""
+        if not path.is_file():
+            return False
+        if self._platform.startswith("win"):
+            return path.suffix.lower() in {".exe", ".bat", ".cmd"}
+        return os.access(path, os.X_OK)
 
     def _try(self, argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str] | None:
         try:
@@ -216,13 +267,12 @@ class _SubprocessConda:
             return None
 
     def available(self) -> bool:
-        """Whether ``conda`` is on PATH (the miniconda gate)."""
-        cp = self._try(["conda", "--version"], timeout=_CONDA_TIMEOUT)
-        return bool(cp and cp.returncode == 0)
+        """Whether ``conda`` is resolvable (``~/miniconda3`` first, then PATH)."""
+        return self._conda_bin() is not None
 
     def env_exists(self) -> bool:
         """Whether the ``chinamaxM`` conda env exists."""
-        cp = self._try(["conda", "env", "list", "--json"], timeout=_CONDA_TIMEOUT)
+        cp = self._try([self._conda_bin() or "conda", "env", "list", "--json"], timeout=_CONDA_TIMEOUT)
         if not cp or cp.returncode != 0:
             return False
         try:
@@ -234,7 +284,7 @@ class _SubprocessConda:
     def env_python_version(self) -> str | None:
         """The env's ``major.minor`` Python version, or ``None`` when unresolvable."""
         cp = self._try(
-            ["conda", "run", "-n", CONDA_ENV, "python", "-c",
+            [self._conda_bin() or "conda", "run", "-n", CONDA_ENV, "python", "-c",
              "import sys;print('%d.%d' % sys.version_info[:2])"],
             timeout=_CONDA_TIMEOUT,
         )
@@ -246,7 +296,7 @@ class _SubprocessConda:
     def env_python_path(self) -> str:
         """The env's Python executable path (the service ExecStart)."""
         cp = self._try(
-            ["conda", "run", "-n", CONDA_ENV, "python", "-c", "import sys;print(sys.executable)"],
+            [self._conda_bin() or "conda", "run", "-n", CONDA_ENV, "python", "-c", "import sys;print(sys.executable)"],
             timeout=_CONDA_TIMEOUT,
         )
         if not cp or cp.returncode != 0:
@@ -259,7 +309,7 @@ class _SubprocessConda:
     def create(self) -> None:
         """Create the env at the pinned Python (only ever called when it is absent)."""
         cp = self._run(
-            ["conda", "create", "-y", "-n", CONDA_ENV, f"python={PY_VERSION}"],
+            [self._conda_bin() or "conda", "create", "-y", "-n", CONDA_ENV, f"python={PY_VERSION}"],
             timeout=_CONDA_CREATE_TIMEOUT,
         )
         if cp.returncode != 0:
@@ -268,7 +318,7 @@ class _SubprocessConda:
     def pip_install(self, plugin_root: Path) -> None:
         """Editable-install the plugin (pulling aiohttp + the pinned litellm from pyproject)."""
         cp = self._run(
-            ["conda", "run", "-n", CONDA_ENV, "pip", "install", "-e", str(plugin_root)],
+            [self._conda_bin() or "conda", "run", "-n", CONDA_ENV, "pip", "install", "-e", str(plugin_root)],
             timeout=_PIP_TIMEOUT,
         )
         if cp.returncode != 0:
@@ -395,6 +445,8 @@ class SetupEngine:
         sleep: Callable[[float], None] | None = None,
         now: Callable[[], float] | None = None,
         platform: str | None = None,
+        home: str | os.PathLike[str] | None = None,
+        machine: str | None = None,
         winsw_exe: str | os.PathLike[str] | None = None,
         service_password: str | None = None,
         ensure_winsw: Callable[..., object] | None = None,
@@ -414,11 +466,13 @@ class SetupEngine:
         )
         self._plugin_root = Path(plugin_root) if plugin_root is not None else _plugin_checkout_root()
         self._platform = platform or sys.platform
+        self._home = Path(home) if home is not None else Path.home()
+        self._machine = machine if machine is not None else platform_mod.machine()
         self._settings_path = self._claude_root / "settings.json"
         self._log_dir = resolve_log_path(self._claude_root).parent
 
         self._run = run or _default_run
-        self._conda = conda or _SubprocessConda(self._run)
+        self._conda = conda or _SubprocessConda(self._run, home=self._home, platform=self._platform)
         self._generate_fn = generate_fn or self._subprocess_generate
         self._port_live = port_live or supervision.port_live
         self._enable_linger = enable_linger or (lambda: supervision.enable_linger(platform=self._platform))
@@ -557,6 +611,65 @@ class SetupEngine:
         """The hook shims' rung-2 interpreter record: ``<claude-root>/chinamaxM/python-path``."""
         return self._log_dir / "python-path"
 
+    def _miniconda_plan(self) -> dict:
+        """The per-OS Miniconda bootstrap plan — the SINGLE source the plan builder (descriptor
+        + title) and the apply method both read, so the executed commands and the digest-bound
+        descriptor can never drift.
+
+        Ports the old plugin's ``doctor`` mechanics verbatim (URLs, arch maps, installer flags,
+        ``conda init`` shells): POSIX runs ``.sh -b -u -p ~/miniconda3`` (``-b -u`` reuses an
+        existing ``~/miniconda3`` so a re-run is idempotent); Windows runs the ``.exe``
+        JustMe/silent installer; both finish with ``conda init``, which EDITS the operator's
+        shell startup files. ``Miniconda3-latest-*`` — NO version pin and NO checksum (ADR 0009
+        as amended). A POSIX machine whose arch is absent from the map yields
+        ``supported=False`` with an advice message and no URL. Windows always uses the x86_64
+        asset and never gate-fails on arch.
+
+        Returns:
+            ``{"url", "prefix", "commands", "supported", "machine"}`` (plus ``"advice"`` when
+            unsupported). ``prefix`` is a str; ``commands`` is a list of argv lists.
+        """
+        prefix = self._home / "miniconda3"
+        if self._platform.startswith("win"):
+            installer = self._home / "chinamaxM-miniconda.exe"
+            url = f"{_MINICONDA_URL_BASE}Miniconda3-latest-Windows-x86_64.exe"
+            commands = [
+                ["curl.exe", "-fsSL", url, "-o", str(installer)],
+                # `/D=<prefix>` MUST be the last token and unquoted (Windows installer rule);
+                # the empty "" is `start`'s window-title argument.
+                ["cmd", "/c", "start", "/wait", "", str(installer),
+                 "/InstallationType=JustMe", "/RegisterPython=0", "/AddToPath=0", "/S",
+                 f"/D={prefix}"],
+                [str(prefix / "Scripts" / "conda.exe"), "init", "cmd.exe", "powershell", "bash"],
+            ]
+            return {"url": url, "prefix": str(prefix), "commands": commands,
+                    "supported": True, "machine": self._machine}
+        machine = self._machine.lower()
+        if self._platform.startswith("darwin"):
+            arch = _DARWIN_MINICONDA_ARCH.get(machine)
+            os_tag, init_shells = "MacOSX", ["bash", "zsh"]
+        else:
+            arch = _LINUX_MINICONDA_ARCH.get(machine)
+            os_tag, init_shells = "Linux", ["bash"]
+        if arch is None:
+            return {
+                "url": None, "prefix": str(prefix), "commands": [], "supported": False,
+                "machine": self._machine,
+                "advice": (
+                    f"unsupported CPU architecture {self._machine!r}; install Miniconda "
+                    f"manually from {_MINICONDA_URL_BASE}, then re-run setup"
+                ),
+            }
+        installer = self._home / ".chinamaxM-miniconda.sh"
+        url = f"{_MINICONDA_URL_BASE}Miniconda3-latest-{os_tag}-{arch}.sh"
+        commands = [
+            ["curl", "-fsSL", url, "-o", str(installer)],
+            ["bash", str(installer), "-b", "-u", "-p", str(prefix)],
+            [str(prefix / "bin" / "conda"), "init", *init_shells],
+        ]
+        return {"url": url, "prefix": str(prefix), "commands": commands,
+                "supported": True, "machine": self._machine}
+
     def _read_settings_flip_state(self) -> list:
         try:
             value = settings_json.read_flip(self._settings_path)
@@ -626,6 +739,15 @@ class SetupEngine:
             run=lambda e, p=path, n=names: e._apply_scaffold(p, n),
         )
 
+    def _conda_create_step(self) -> PlanStep:
+        """The create-the-env step, shared by the fresh-bootstrap and env-absent branches."""
+        return PlanStep(
+            id="conda-env", kind="mutating", action="CREATE",
+            title=f"Create conda env {CONDA_ENV} (python {PY_VERSION})", targets=[],
+            descriptor={"op": "conda-create", "env": CONDA_ENV, "python": PY_VERSION},
+            run=lambda e: e._apply_conda_create(),
+        )
+
     # -- plan phase -----------------------------------------------------------------
 
     def build_plan(self) -> Plan:
@@ -644,22 +766,38 @@ class SetupEngine:
         steps: list[PlanStep] = []
         codex_present = pc["codex_home_exists"]
 
-        # (a) conda env — miniconda gate, then create-only-when-absent (never auto-recreate).
+        # (a) conda env — bootstrap Miniconda when conda is absent (ADR 0009 as amended:
+        # /setup now INSTALLS Miniconda per-OS instead of gating), then create-only-when-absent
+        # (never auto-recreate).
         if not pc["conda_available"]:
-            steps.append(PlanStep(
-                id="conda-env", kind="mutating", action="GATE-FAIL",
-                title="Miniconda / conda prerequisite", targets=[],
-                descriptor={"op": "gate_fail", "reason": "conda-unavailable"},
-                gate_fail=True,
-                gate_detail="conda is not on PATH — install Miniconda, then re-run setup",
-            ))
+            mc = self._miniconda_plan()
+            if not mc["supported"]:
+                # POSIX arch off the map: advice-only gate (no URL); setup aborts here as before.
+                steps.append(PlanStep(
+                    id="conda-bootstrap", kind="mutating", action="GATE-FAIL",
+                    title="Bootstrap Miniconda (unsupported CPU architecture)", targets=[],
+                    descriptor={"op": "gate_fail", "reason": "unsupported-arch", "machine": mc["machine"]},
+                    gate_fail=True,
+                    gate_detail=mc["advice"],
+                ))
+            else:
+                steps.append(PlanStep(
+                    id="conda-bootstrap", kind="mutating", action="BOOTSTRAP",
+                    title=(
+                        f"Bootstrap Miniconda into {mc['prefix']} (downloads {mc['url']}; then "
+                        "runs conda init, which EDITS your shell startup files)"
+                    ),
+                    targets=[mc["prefix"]],
+                    descriptor={
+                        "op": "conda-bootstrap", "url": mc["url"],
+                        "prefix": mc["prefix"], "commands": mc["commands"],
+                    },
+                    run=lambda e: e._apply_conda_bootstrap(),
+                ))
+                # conda was absent, so the env cannot exist yet — create it next.
+                steps.append(self._conda_create_step())
         elif not pc["conda_env_exists"]:
-            steps.append(PlanStep(
-                id="conda-env", kind="mutating", action="CREATE",
-                title=f"Create conda env {CONDA_ENV} (python {PY_VERSION})", targets=[],
-                descriptor={"op": "conda-create", "env": CONDA_ENV, "python": PY_VERSION},
-                run=lambda e: e._apply_conda_create(),
-            ))
+            steps.append(self._conda_create_step())
         elif pc["conda_env_python"] != PY_VERSION:
             steps.append(PlanStep(
                 id="conda-env", kind="mutating", action="GATE-FAIL",
@@ -846,6 +984,34 @@ class SetupEngine:
         return results
 
     # -- apply actions --------------------------------------------------------------
+
+    def _apply_conda_bootstrap(self) -> str:
+        """Install Miniconda per-OS, then make the fresh conda resolvable in-process.
+
+        Runs the :meth:`_miniconda_plan` commands in order (download → silent install → conda
+        init), stopping on the FIRST non-zero returncode. On success, prepends the miniconda
+        launcher dir(s) to ``os.environ['PATH']`` so the following env-create/pip steps and the
+        post-apply re-diagnose resolve the just-installed conda (the conda seam ALSO probes
+        ``~/miniconda3`` directly). ``conda init`` EDITS the operator's shell startup files.
+
+        Known Windows risk (mocked-only, ADR 0009): ``start /wait`` does not reliably propagate
+        the installer's exit code to ``%ERRORLEVEL%`` on all Windows versions, so a failed
+        silent install may slip past this stop-on-first-failure check on Windows.
+        """
+        mc = self._miniconda_plan()
+        prefix = mc["prefix"]
+        timeouts = (_MINICONDA_DL_TIMEOUT, _MINICONDA_INSTALL_TIMEOUT, _CONDA_INIT_TIMEOUT)
+        for cmd, timeout in zip(mc["commands"], timeouts):
+            cp = self._run(cmd, timeout=timeout)
+            if cp.returncode != 0:
+                raise SetupError(f"Miniconda bootstrap failed: {' '.join(cmd)} (exit {cp.returncode})")
+        if self._platform.startswith("win"):
+            launcher_dirs = [str(Path(prefix) / "Scripts"), str(Path(prefix) / "condabin")]
+        else:
+            launcher_dirs = [str(Path(prefix) / "bin")]
+        existing = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join([*launcher_dirs, existing] if existing else launcher_dirs)
+        return f"installed Miniconda at {prefix}"
 
     def _apply_conda_create(self) -> str:
         self._conda.create()

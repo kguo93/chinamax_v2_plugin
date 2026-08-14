@@ -45,6 +45,11 @@ Removes ONLY the env flip and the service; keys, agents, and Linux linger are le
 
 - Concurrency: single-operator only — never run setup concurrently (no cross-process lock in v0.1).
 - No command path ever prints an API-key value; probe failures show only the parsed error type/message.
+- Conda: when `conda` is missing the plan includes a Miniconda bootstrap step that downloads the
+  official installer (on approval) and runs `conda init`, which EDITS the operator's shell startup
+  files — both disclosed in the plan step's title. It is idempotent (reuses an existing
+  `~/miniconda3`). On an unsupported CPU architecture the plan gate-fails with advice to install
+  Miniconda manually, then re-run.
 - Windows: supported. The service step acquires the WinSW wrapper automatically — it uses an
   operator-supplied `--winsw-exe <path>` if given, else a WinSW exe already installed under the
   service dir, else it downloads the pinned, SHA-256-verified official WinSW release (failing

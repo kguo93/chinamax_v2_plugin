@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,11 +19,15 @@ import pytest
 from chinamaxM import doctor, settings_json
 from chinamaxM.ops.supervision import SupervisionStatus
 from chinamaxM.setup import (
+    _CONDA_INIT_TIMEOUT,
+    _MINICONDA_DL_TIMEOUT,
+    _MINICONDA_INSTALL_TIMEOUT,
     ProbeResponse,
     SetupEngine,
     SetupError,
     _run_generation,
     _Runner,
+    _SubprocessConda,
     render_plan,
     render_report,
 )
@@ -123,6 +128,23 @@ class FakeHttp:
 def _ok_run(argv, *, timeout, env=None):
     """A fake subprocess runner (no real conda/codex ever runs, so no tokens are spent)."""
     return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+class RecordingRun:
+    """A fake subprocess runner recording every argv + timeout; failures are scriptable.
+
+    ``fail_on`` is an optional predicate over the argv list; when it returns True the call
+    reports a non-zero returncode (so stop-on-first-failure paths can be exercised).
+    """
+
+    def __init__(self, fail_on=None):
+        self.calls: list[dict] = []
+        self._fail_on = fail_on
+
+    def __call__(self, argv, *, timeout, env=None):
+        self.calls.append({"argv": list(argv), "timeout": timeout, "env": env})
+        rc = 1 if (self._fail_on is not None and self._fail_on(list(argv))) else 0
+        return subprocess.CompletedProcess(argv, rc, "", "")
 
 
 def _healthy_findings():
@@ -727,3 +749,194 @@ def test_records_and_removes_python_path(tmp_path):
     report_td2 = engine.teardown(engine.build_teardown_plan().digest)
     assert report_td2.exit_code == 0
     assert {r.id: r.status for r in report_td2.step_results}["python-path-remove"] == "ok"
+
+
+# ------------------------------------------------------- Conda bootstrap (Miniconda auto-install)
+
+
+def _bootstrap_step(plan):
+    return next(s for s in plan.steps if s.id == "conda-bootstrap")
+
+
+@pytest.mark.parametrize(
+    "platform,machine,os_tag,arch,init_shells",
+    [
+        ("linux", "x86_64", "Linux", "x86_64", ["bash"]),
+        ("linux", "aarch64", "Linux", "aarch64", ["bash"]),
+        ("darwin", "arm64", "MacOSX", "arm64", ["bash", "zsh"]),
+    ],
+)
+def test_conda_bootstrap_posix_plan_emission(tmp_path, platform, machine, os_tag, arch, init_shells):
+    """conda absent ⇒ a BOOTSTRAP step whose descriptor is the exact per-OS installer plan."""
+    engine, _ctx = make_engine(
+        tmp_path, conda=FakeConda(available=False),
+        platform=platform, machine=machine, home=tmp_path,
+    )
+    plan = engine.build_plan()
+    step = _bootstrap_step(plan)
+    prefix = tmp_path / "miniconda3"
+    installer = tmp_path / ".chinamaxM-miniconda.sh"
+    url = f"https://repo.anaconda.com/miniconda/Miniconda3-latest-{os_tag}-{arch}.sh"
+    assert step.action == "BOOTSTRAP"
+    assert step.descriptor["url"] == url
+    assert step.descriptor["prefix"] == str(prefix)
+    assert step.descriptor["commands"] == [
+        ["curl", "-fsSL", url, "-o", str(installer)],
+        ["bash", str(installer), "-b", "-u", "-p", str(prefix)],
+        [str(prefix / "bin" / "conda"), "init", *init_shells],
+    ]
+    # The env cannot exist yet ⇒ a CREATE step follows the bootstrap.
+    ids = [s.id for s in plan.steps]
+    assert ids.index("conda-bootstrap") < ids.index("conda-env")
+    assert next(s for s in plan.steps if s.id == "conda-env").action == "CREATE"
+
+
+def test_conda_bootstrap_windows_plan_emission(tmp_path):
+    """Windows (machine AMD64): the exact curl.exe/JustMe-silent/conda-init argv, x86_64 asset."""
+    engine, _ctx = make_engine(
+        tmp_path, conda=FakeConda(available=False),
+        platform="windows", machine="AMD64", home=tmp_path,
+    )
+    plan = engine.build_plan()
+    step = _bootstrap_step(plan)
+    prefix = tmp_path / "miniconda3"
+    installer = tmp_path / "chinamaxM-miniconda.exe"
+    url = "https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe"
+    assert step.action == "BOOTSTRAP"
+    assert step.descriptor["url"] == url
+    assert step.descriptor["commands"] == [
+        ["curl.exe", "-fsSL", url, "-o", str(installer)],
+        ["cmd", "/c", "start", "/wait", "", str(installer),
+         "/InstallationType=JustMe", "/RegisterPython=0", "/AddToPath=0", "/S", f"/D={prefix}"],
+        [str(prefix / "Scripts" / "conda.exe"), "init", "cmd.exe", "powershell", "bash"],
+    ]
+    assert next(s for s in plan.steps if s.id == "conda-env").action == "CREATE"
+
+
+def test_conda_bootstrap_apply_runs_commands_in_order(tmp_path, monkeypatch):
+    """Apply issues the exact download→install→init argv in order, each with its own timeout."""
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))  # in-process PATH prepend auto-restored
+    run = RecordingRun()
+    engine, ctx = make_engine(
+        tmp_path, conda=FakeConda(available=False),
+        platform="linux", machine="x86_64", home=tmp_path, run=run,
+    )
+    plan = engine.build_plan()
+    report = engine.apply(plan.digest)
+    assert report.exit_code == 0, render_report(report)
+
+    prefix = tmp_path / "miniconda3"
+    installer = tmp_path / ".chinamaxM-miniconda.sh"
+    url = "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+    assert [c["argv"] for c in run.calls[:3]] == [
+        ["curl", "-fsSL", url, "-o", str(installer)],
+        ["bash", str(installer), "-b", "-u", "-p", str(prefix)],
+        [str(prefix / "bin" / "conda"), "init", "bash"],
+    ]
+    assert [c["timeout"] for c in run.calls[:3]] == [
+        _MINICONDA_DL_TIMEOUT, _MINICONDA_INSTALL_TIMEOUT, _CONDA_INIT_TIMEOUT,
+    ]
+    # After the fresh install the env-create step runs next (FakeConda records the create).
+    assert ctx["conda"].created == 1 and ctx["conda"].pip_calls
+    assert {r.id: r.status for r in report.step_results}["conda-bootstrap"] == "ok"
+
+
+def test_conda_bootstrap_apply_stops_on_first_failure(tmp_path, monkeypatch):
+    """A non-zero installer return fails the bootstrap step and aborts the rest; init never runs."""
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+    run = RecordingRun(fail_on=lambda argv: argv[:1] == ["bash"])  # the installer command fails
+    engine, ctx = make_engine(
+        tmp_path, conda=FakeConda(available=False),
+        platform="linux", machine="x86_64", home=tmp_path, run=run,
+    )
+    plan = engine.build_plan()
+    report = engine.apply(plan.digest)
+
+    outcomes = {r.id: r.status for r in report.step_results}
+    assert outcomes["conda-bootstrap"] == "failed"
+    assert outcomes["conda-env"] == "aborted" and outcomes["env-flip"] == "aborted"
+    assert ctx["conda"].created == 0  # never reached the env-create step
+    # Only curl + the failing installer ran; conda init was never issued.
+    assert [c["argv"][0] for c in run.calls] == ["curl", "bash"]
+    assert not (tmp_path / "claude" / "settings.json").exists()
+    assert report.exit_code == 1
+
+
+def test_conda_bootstrap_unsupported_arch_gates(tmp_path):
+    """POSIX arch off the map ⇒ advice-only gate, no BOOTSTRAP step, no leaked installer URL."""
+    engine, ctx = make_engine(
+        tmp_path, conda=FakeConda(available=False),
+        platform="linux", machine="ppc64le", home=tmp_path,
+    )
+    plan = engine.build_plan()
+    assert not any(s.action == "BOOTSTRAP" for s in plan.steps)
+    gate = _bootstrap_step(plan)
+    assert gate.gate_fail and gate.action == "GATE-FAIL"
+    assert "unsupported CPU architecture" in gate.gate_detail and "ppc64le" in gate.gate_detail
+    assert "Miniconda3-latest" not in gate.gate_detail
+    assert "Miniconda3-latest" not in render_plan(plan)
+
+    report = engine.apply(plan.digest)
+    assert {r.id: r.status for r in report.step_results}["conda-bootstrap"] == "failed"
+    assert ctx["conda"].created == 0 and report.exit_code == 1
+
+
+def test_conda_bootstrap_skipped_when_conda_available(tmp_path):
+    """conda already present ⇒ no bootstrap step; the normal create step is planned instead."""
+    engine, _ctx = make_engine(tmp_path)  # default FakeConda(available=True, exists=False)
+    plan = engine.build_plan()
+    assert not any(s.id == "conda-bootstrap" for s in plan.steps)
+    assert not any(s.action == "BOOTSTRAP" for s in plan.steps)
+    assert any(s.id == "conda-env" and s.action == "CREATE" for s in plan.steps)
+
+
+def test_conda_bootstrap_digest_binds_machine(tmp_path):
+    """The plan digest changes when the machine changes the bootstrap URL (nothing else varies)."""
+    home = tmp_path / "home"
+    e1, _ = make_engine(tmp_path, conda=FakeConda(available=False), platform="linux", machine="x86_64", home=home)
+    e2, _ = make_engine(tmp_path, conda=FakeConda(available=False), platform="linux", machine="aarch64", home=home)
+    assert e1.build_plan().digest != e2.build_plan().digest
+
+
+def test_conda_bin_precedence_and_which_fallback(tmp_path, monkeypatch):
+    """_SubprocessConda resolves ~/miniconda3 first (POSIX bin / Windows Scripts), else shutil.which."""
+    from chinamaxM import setup as setup_mod
+
+    # POSIX: an executable ~/miniconda3/bin/conda resolves to its absolute path, not bare "conda".
+    posix_home = tmp_path / "posix"
+    bin_dir = posix_home / "miniconda3" / "bin"
+    bin_dir.mkdir(parents=True)
+    conda_stub = bin_dir / "conda"
+    conda_stub.write_text("#!/bin/sh\n")
+    conda_stub.chmod(0o755)
+    rec = RecordingRun()
+    seam = _SubprocessConda(rec, home=posix_home, platform="linux")
+    assert seam._conda_bin() == str(conda_stub)
+    assert seam.available() is True
+    seam.create()
+    assert rec.calls[-1]["argv"][0] == str(conda_stub)  # create() invokes the absolute launcher
+
+    # Windows: Scripts\conda.exe wins by suffix (no exec bit needed on a POSIX test host).
+    win_home = tmp_path / "win"
+    scripts = win_home / "miniconda3" / "Scripts"
+    scripts.mkdir(parents=True)
+    win_conda = scripts / "conda.exe"
+    win_conda.write_bytes(b"MZ")
+    win_seam = _SubprocessConda(RecordingRun(), home=win_home, platform="windows")
+    assert win_seam._conda_bin() == str(win_conda)
+
+    # Fallback: no ~/miniconda3 ⇒ shutil.which resolves conda; None ⇒ the bare "conda" argv[0].
+    empty_home = tmp_path / "empty"
+    empty_home.mkdir()
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda name: "/opt/conda/bin/conda")
+    fallback = _SubprocessConda(RecordingRun(), home=empty_home, platform="linux")
+    assert fallback._conda_bin() == "/opt/conda/bin/conda"
+    assert fallback.available() is True
+
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda name: None)
+    absent = _SubprocessConda(RecordingRun(), home=empty_home, platform="linux")
+    assert absent._conda_bin() is None
+    assert absent.available() is False
+    bare_rec = RecordingRun()
+    _SubprocessConda(bare_rec, home=empty_home, platform="linux").create()
+    assert bare_rec.calls[-1]["argv"][0] == "conda"  # nothing resolvable ⇒ bare "conda"
