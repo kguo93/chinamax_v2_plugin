@@ -30,7 +30,8 @@ log (which path answered) — no Registry field, no doctor probe. Closes sketch 
   `prompt_tokens_details`, and the log keeps each provider's shape untouched (the cache
   watch reads whichever variant the provider emits).
 - **Schema gains `count_tokens_path`** — present only on count_tokens lines, recording
-  which path answered: `forwarded` or `estimator`.
+  which path answered: `upstream` or `estimated` (corrected 2026-08-14 to match the shipped
+  `chinamaxM.observability` / proxy values — see the amendment below).
 - **count_tokens failure enumeration** ("never errors the host" is scoped): 404/405/501
   and malformed bodies → estimator (cached as unsupported per the runtime discovery
   above); TRANSPORT failure → estimator, but NOT cached as unsupported; any other
@@ -38,3 +39,21 @@ log (which path answered) — no Registry field, no doctor probe. Closes sketch 
 - **Prefix-era field semantics** (cross-ref ADR 0001, amended 2026-08-13): `model` logs
   the FORWARDED model string (profile prefix already stripped); `profile` carries the
   Profile name. The log path resolves under ADR 0006's canonical root chain.
+
+**Amended 2026-08-14 (optional `synthesized_max_tokens` field).** The schema gains an
+OPTIONAL integer line field `synthesized_max_tokens`, present ONLY on Responses-ingress
+(Seam) lines where the Seam synthesized the Anthropic `max_tokens` cap — i.e. the inbound
+Responses request omitted `max_output_tokens`, so the Seam supplied its deterministic
+`DEFAULT_MAX_TOKENS` (8192; ADR 0002). Its value is the synthesized cap actually forwarded
+upstream. It is OMITTED on every other line: on Seam lines that carried an explicit
+`max_output_tokens`, and on all relay / default / count_tokens lines (present-only, exactly
+like `stripped_tools` / `count_tokens_path`; never a null/absent key). Rationale: closes
+proxy-03's truncation-diagnosability intent — the silent cap is otherwise invisible in the
+log, and `usage.output_tokens ≈ synthesized_max_tokens` ⇒ truncation is likely. No
+`stop_reason` field is added; truncation stays INFERRED, not definitive (2026-08-14
+decision).
+
+This amendment also **corrects the 2026-08-13 wording** above: the `count_tokens_path`
+values are `upstream` / `estimated` (as the shipped `chinamaxM.observability` / proxy set
+them and the JSONL carries), NOT the `forwarded` / `estimator` the prose originally named —
+a documentation typo, not a behavior change.

@@ -197,6 +197,42 @@ async def test_stripped_tools_logged_iff_stripped(make_seam_client):
     assert "stripped_tools" not in records2[0]
 
 
+async def test_synthesized_max_tokens_logged_iff_seam_synthesized(
+    make_seam_client, make_proxy, relay_registry, claude_home, fake_provider
+):
+    """Fix 3: the Seam logs synthesized_max_tokens ONLY when it synthesized the cap."""
+    seam_usage = {"input_tokens": 12, "output_tokens": 3}
+
+    # (a) Seam request OMITTING max_output_tokens ⇒ the Seam synthesizes 8192 ⇒ logged.
+    records: list[dict] = []
+    client, fake = await make_seam_client("glm", log_sink=records.append)
+    fake.respond(headers=JSON_HEADERS, body=_anthropic_json(seam_usage))
+    await client.send({"model": "glm-5.2", "input": [_user_text("hi")]})
+    assert len(records) == 1
+    assert records[0]["ingress"] == "responses"
+    assert records[0]["synthesized_max_tokens"] == 8192  # the Seam's DEFAULT_MAX_TOKENS
+
+    # (b) Seam request SUPPLYING max_output_tokens ⇒ no synthesis ⇒ the key is absent.
+    records2: list[dict] = []
+    client2, fake2 = await make_seam_client("glm", log_sink=records2.append)
+    fake2.respond(headers=JSON_HEADERS, body=_anthropic_json(seam_usage))
+    await client2.send({"model": "glm-5.2", "input": [_user_text("hi")], "max_output_tokens": 256})
+    assert len(records2) == 1
+    assert "synthesized_max_tokens" not in records2[0]
+
+    # (c) A relay (Anthropic-ingress) line never carries the key.
+    claude_home.write_keys(_ALL_KEYS)
+    records3: list[dict] = []
+    client3 = await make_proxy(relay_registry, claude_home=str(claude_home.root), log_sink=records3.append)
+    fake_provider.respond(status=200, headers=JSON_HEADERS, body=_anthropic_json(seam_usage))
+    await client3.post(
+        "/v1/messages", data=json.dumps({"model": "deepseek/m"}).encode(), skip_auto_headers=["Content-Type"]
+    )
+    assert len(records3) == 1
+    assert records3[0]["ingress"] == "anthropic"
+    assert "synthesized_max_tokens" not in records3[0]
+
+
 async def test_default_branch_never_logged(make_proxy, claude_home, fake_provider):
     """AC-3: N Default-branch requests leave the log file ABSENT (not merely empty)."""
     claude_home.write_keys(_ALL_KEYS)

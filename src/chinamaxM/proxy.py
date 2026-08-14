@@ -183,14 +183,16 @@ class _Completion:
     usage: dict | None = None
     stripped_tools: list | None = None
     count_tokens_path: str | None = None
+    synthesized_max_tokens: int | None = None
 
 
 def _finalize(request: web.Request, comp: _Completion, start: float) -> None:
     """Assemble and write one JSONL line; the sink is best-effort and never fails a request.
 
     ``stripped_tools`` appears only when the Seam dropped tool types; ``count_tokens_path``
-    only on count_tokens lines that forwarded or estimated. ``usage`` is the provider object
-    verbatim, or ``null``.
+    only on count_tokens lines that forwarded or estimated; ``synthesized_max_tokens`` only
+    on Seam lines where the Seam synthesized the ``max_tokens`` cap (ADR 0010 as amended).
+    ``usage`` is the provider object verbatim, or ``null``.
     """
     line: dict = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -206,6 +208,8 @@ def _finalize(request: web.Request, comp: _Completion, start: float) -> None:
         line["stripped_tools"] = comp.stripped_tools
     if comp.count_tokens_path is not None:
         line["count_tokens_path"] = comp.count_tokens_path
+    if comp.synthesized_max_tokens is not None:
+        line["synthesized_max_tokens"] = comp.synthesized_max_tokens
     try:
         request.app["log_sink"](line)
     except Exception:  # observability must never corrupt a valid response
@@ -464,6 +468,10 @@ async def _seam_dispatch(request: web.Request, profile: Profile) -> web.StreamRe
         comp.model = anthropic_body["model"]
         if meta.stripped_tools:
             comp.stripped_tools = list(meta.stripped_tools)
+        if meta.synthesized_max_tokens:
+            # Log the synthesized cap actually forwarded upstream so truncation at the
+            # silent DEFAULT_MAX_TOKENS stays diagnosable (ADR 0010 as amended).
+            comp.synthesized_max_tokens = anthropic_body["max_tokens"]
 
         if stream:
             return await _seam_stream(request, profile, key, anthropic_body, comp)
