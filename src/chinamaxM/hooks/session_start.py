@@ -23,6 +23,7 @@ import json
 import os
 import socket
 import sys
+from pathlib import Path
 
 #: The Claude warn-only message, pointing the operator at the doctor command.
 _CLAUDE_SYSTEM_MESSAGE = (
@@ -103,7 +104,7 @@ def _codex_warning() -> str | None:
     return _CODEX_SYSTEM_MESSAGE
 
 
-def _codex_configured(config_path, provider_prefix: str) -> bool:
+def _codex_configured(config_path: Path, provider_prefix: str) -> bool:
     """Return whether ``config.toml`` carries a generated ``chinamaxM-`` provider entry."""
     import tomllib
 

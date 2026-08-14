@@ -296,11 +296,7 @@ class _SubprocessConda:
 
     def _is_conda_executable(self, path: Path) -> bool:
         """Whether ``path`` is an existing executable, keyed on the injected Platform."""
-        if not path.is_file():
-            return False
-        if self._platform.startswith("win"):
-            return path.suffix.lower() in {".exe", ".bat", ".cmd"}
-        return os.access(path, os.X_OK)
+        return _is_executable(str(path), self._platform)
 
     def _try(self, argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str] | None:
         try:
@@ -527,7 +523,7 @@ class SetupEngine:
         plugin_root: str | os.PathLike[str] | None = None,
         run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         diagnose: Callable[[], list] | None = None,
-        prerequisites: Callable[[], "dict[str, bool]"] | None = None,
+        prerequisites: Callable[[], dict[str, bool]] | None = None,
         generate_fn: Callable[[object, Mapping[str, Path], bool], dict] | None = None,
         conda: object | None = None,
         service_status: Callable[[object], object] | None = None,

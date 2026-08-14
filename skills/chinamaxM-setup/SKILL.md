@@ -28,7 +28,7 @@ any headless run (`codex exec` blocks on an open pipeline stdin):
 A Platform Prerequisite is missing. The engine NEVER downloads or runs an installer — the host
 does, on approval. Do not summarize; the operator acts on the specific rows.
 
-2. Show each rectification row: name, summary, install_location, run_policy, commands. Warn that
+2. Show each Rectification row: name, summary, install_location, run_policy, commands. Warn that
    a `miniconda` row runs `conda init`, which edits shell startup files.
 3. Ask exactly: reply "approve" to install these, anything else to stop.
 4. Reply is not "approve" → stop. Report that no prerequisite was installed. (Do NOT claim
@@ -89,7 +89,7 @@ Removes ONLY the env flip and the service; keys, agents, and Linux linger are le
 - Concurrency: single-operator only — never run setup concurrently (no cross-process lock in v0.1).
 - No command path ever prints an API-key value; probe failures show only the parsed error type/message.
 - Prerequisites: setup DETECTS `bash` / Git for Windows / Miniconda and, when any is missing,
-  PAUSES with agent-run rectification rows before any mutation — the engine never downloads or
+  PAUSES with agent-run Rectification rows before any mutation — the engine never downloads or
   runs an installer, and needs no pre-installed Python (on a bare Windows box the zero-state block
   above bootstraps Git and Miniconda from cmd.exe). Git for Windows is bootstrapped because the
   Codex hooks need its bash. A `miniconda` row installs `Miniconda3-latest-*` (NO version pin, NO
