@@ -13,6 +13,8 @@ Public surface (pinned so hosts-04/05 consume a stable interface):
 * :func:`install`, :func:`update`, :func:`teardown`, :func:`status` — each takes an
   optional ``platform`` override and an injectable ``runner``.
 * :func:`render` — the artifact bytes + install path, for content tests and diagnosis.
+* :func:`ensure_winsw_exe` — resolve the Windows WinSW exe (operator override →
+  already-installed → pinned, SHA-256-verified download; fails CLOSED on mismatch).
 * :func:`port_live` — a standalone loopback readiness probe.
 * :func:`enable_linger` / :func:`linger_enabled` — ``loginctl`` wrappers (no-op with a
   diagnosable status off-Linux).
@@ -27,11 +29,13 @@ Windows service password travels in-memory only, applied after install via
 from __future__ import annotations
 
 import getpass
+import hashlib
 import os
 import re
 import socket
 import subprocess
 import sys
+import urllib.request
 import plistlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -51,6 +55,7 @@ __all__ = [
     "teardown",
     "status",
     "render",
+    "ensure_winsw_exe",
     "port_live",
     "enable_linger",
     "linger_enabled",
@@ -72,6 +77,17 @@ _LAUNCHD_LABEL = "com.chinamaxM.proxy"
 _WINSW_SERVICE_ID = "chinamaxM"
 _WINSW_XML_NAME = "chinamaxM-service.xml"
 _WINSW_EXE_NAME = "chinamaxM-service.exe"
+
+#: Pinned official WinSW release auto-acquired when no exe is supplied (ADR 0009 as
+#: amended): winsw/winsw v2.12.0, asset ``WinSW-x64.exe``.
+WINSW_DOWNLOAD_URL = "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe"
+
+#: SHA-256 of that pinned asset (from the official GitHub release). The auto-download fails
+#: CLOSED on any mismatch. This is a PUBLIC checksum, never a secret.
+WINSW_SHA256 = "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
+
+#: Read timeout (seconds) for the WinSW auto-download.
+_WINSW_DOWNLOAD_TIMEOUT = 120.0
 
 #: ``sys.platform`` / override tokens → the supported OS key.
 _PLATFORM_ALIASES = {
@@ -184,8 +200,9 @@ class SupervisionConfig:
             ``["-m", "chinamaxM.proxy"]``; must be a non-empty list of strings.
         port: The Registry-controlled Proxy port, 1–65535 (ADR 0001, default 8402).
         log_dir: The log/artifact base directory; defaults to :func:`default_log_dir`.
-        winsw_exe_path: The operator-supplied WinSW executable (Windows only); when set
-            it must exist. Never auto-downloaded (v0.1).
+        winsw_exe_path: The resolved WinSW executable (Windows only); when set it must
+            exist. Setup resolves it via :func:`ensure_winsw_exe` (operator override →
+            already-installed → pinned, SHA-256-verified download; ADR 0009 as amended).
         service_password: An optional in-memory Windows service-account password, applied
             after install via ``sc.exe config`` — NEVER serialized into any artifact.
 
@@ -633,6 +650,85 @@ class _LaunchdManager(_Manager):
 
 
 # --------------------------------------------------------------------------- WinSW
+
+
+def _default_winsw_download(url: str) -> bytes:
+    """Download the pinned WinSW release and return its bytes (the production fetch seam)."""
+    with urllib.request.urlopen(url, timeout=_WINSW_DOWNLOAD_TIMEOUT) as response:
+        return response.read()
+
+
+def _sha256_hex(data: bytes) -> str:
+    """Return the lowercase hex SHA-256 digest of ``data``."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def ensure_winsw_exe(
+    service_dir: str | os.PathLike[str],
+    *,
+    override_path: str | os.PathLike[str] | None = None,
+    downloader: Callable[[str], bytes] = _default_winsw_download,
+    hasher: Callable[[bytes], str] = _sha256_hex,
+) -> Path:
+    """Resolve the WinSW executable for the Windows service (idempotent, fails CLOSED).
+
+    Resolution order:
+
+    1. ``override_path`` — an operator-supplied WinSW exe (offline/custom hosts). It must be
+       an existing file, else :class:`SupervisionError`; returned unchanged, no download.
+    2. An exe already at ``<service_dir>/chinamaxM-service.exe`` — a prior install, returned
+       unchanged and never re-downloaded.
+    3. Otherwise download the pinned official winsw release from :data:`WINSW_DOWNLOAD_URL`,
+       verify its SHA-256 against :data:`WINSW_SHA256`, and place it atomically at
+       ``<service_dir>/chinamaxM-service.exe`` (WinSW bundled mode requires the exe basename
+       to match the XML basename ``chinamaxM-service``). A checksum MISMATCH raises and
+       writes NO exe — an unverified service binary is never installed.
+
+    ``downloader`` (``url -> bytes``) and ``hasher`` (``bytes -> hex sha256``) are injectable
+    so tests never touch the network.
+
+    Args:
+        service_dir: The WinSW service directory (``<log_dir>/service``).
+        override_path: An operator-supplied WinSW exe that wins over auto-acquisition.
+        downloader: The fetch seam; defaults to a urllib download of the pinned URL.
+        hasher: The digest seam; defaults to SHA-256.
+
+    Returns:
+        The path to the resolved WinSW executable.
+
+    Raises:
+        SupervisionError: On a missing override, a download/transport failure, or a SHA-256
+            mismatch (fail closed — no exe is placed).
+    """
+    if override_path is not None:
+        path = Path(override_path)
+        if not path.is_file():
+            raise SupervisionError(
+                message=f"--winsw-exe path is not an existing file: {str(path)!r}"
+            )
+        return path
+
+    service_dir = Path(service_dir)
+    installed = service_dir / _WINSW_EXE_NAME
+    if installed.is_file():
+        return installed
+
+    try:
+        payload = downloader(WINSW_DOWNLOAD_URL)
+    except OSError as exc:  # urllib.error.URLError is an OSError subclass
+        raise SupervisionError(
+            message=f"failed to download WinSW from {WINSW_DOWNLOAD_URL}: {exc}"
+        ) from exc
+    digest = hasher(payload)
+    if digest != WINSW_SHA256:
+        raise SupervisionError(
+            message=(
+                f"WinSW download checksum mismatch (expected {WINSW_SHA256}, got "
+                f"{digest}); refusing to install an unverified service binary"
+            )
+        )
+    _atomic_write(installed, payload)  # temp file + os.replace; never a partial exe
+    return installed
 
 
 class _WinswManager(_Manager):

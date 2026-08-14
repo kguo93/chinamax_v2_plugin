@@ -395,6 +395,9 @@ class SetupEngine:
         sleep: Callable[[float], None] | None = None,
         now: Callable[[], float] | None = None,
         platform: str | None = None,
+        winsw_exe: str | os.PathLike[str] | None = None,
+        service_password: str | None = None,
+        ensure_winsw: Callable[..., object] | None = None,
     ) -> None:
         # Bootstrap: import the composed modules lazily (never at module load).
         from chinamaxM.keyfiles import resolve_host_root
@@ -425,6 +428,13 @@ class SetupEngine:
         self._service_update = service_update or (lambda cfg: supervision.update(cfg, platform=self._platform))
         self._service_teardown = service_teardown or (lambda cfg: supervision.teardown(cfg, platform=self._platform))
         self._service_render = service_render or (lambda cfg: supervision.render(cfg, platform=self._platform))
+        self._winsw_exe = str(winsw_exe) if winsw_exe is not None else None
+        self._service_password = service_password
+        self._ensure_winsw = ensure_winsw or (
+            lambda service_dir, override_path=None: supervision.ensure_winsw_exe(
+                service_dir, override_path=override_path
+            )
+        )
         self._http = http or _default_http
         self._sleep = sleep or time.sleep
         self._now = now or time.monotonic
@@ -503,17 +513,49 @@ class SetupEngine:
             port=self._registry.port, log_dir=self._log_dir,
         )
 
-    def _install_cfg(self) -> SupervisionConfig:
-        """A config for install/update carrying the env Python as the service ExecStart."""
+    def _install_cfg(self, winsw_exe_path: str | os.PathLike[str] | None = None) -> SupervisionConfig:
+        """A config for install/update carrying the env Python as the service ExecStart.
+
+        On Windows ``winsw_exe_path`` is the WinSW exe resolved by :func:`ensure_winsw_exe`
+        and ``service_password`` (if supplied) rides in-memory only; both are ``None`` on
+        Linux/macOS.
+        """
         from chinamaxM.ops.supervision import SupervisionConfig
 
         return SupervisionConfig(
             python_path=self._conda.env_python_path(), entry=list(PROXY_ENTRY),
             port=self._registry.port, log_dir=self._log_dir,
+            winsw_exe_path=winsw_exe_path, service_password=self._service_password,
         )
+
+    def _winsw_source(self) -> dict:
+        """Classify the WinSW acquisition source for the plan (read-only; NEVER downloads).
+
+        Mirrors :func:`ensure_winsw_exe`'s branch selection without side effects so the plan
+        render + digest bind the source ``--apply`` will actually acquire.
+        """
+        from chinamaxM.ops import supervision
+
+        if self._winsw_exe is not None:
+            return {"kind": "supplied", "path": self._winsw_exe,
+                    "render": f"supplied: {self._winsw_exe}"}
+        service_dir = self._service_artifact_path().parent
+        installed = service_dir / supervision._WINSW_EXE_NAME
+        if installed.is_file():
+            return {"kind": "already-installed", "path": str(installed),
+                    "render": f"already installed: {installed}"}
+        return {"kind": "download", "url": supervision.WINSW_DOWNLOAD_URL,
+                "render": (
+                    f"download pinned WinSW v2.12.0 (sha256-verified) from "
+                    f"{supervision.WINSW_DOWNLOAD_URL}"
+                )}
 
     def _service_artifact_path(self) -> Path:
         return Path(self._service_render(self._status_cfg()).path)
+
+    def _python_path_file(self) -> Path:
+        """The hook shims' rung-2 interpreter record: ``<claude-root>/chinamaxM/python-path``."""
+        return self._log_dir / "python-path"
 
     def _read_settings_flip_state(self) -> list:
         try:
@@ -645,6 +687,19 @@ class SetupEngine:
             run=lambda e: e._apply_pip_install(),
         ))
 
+        # (a3) record the resolved env Python for the hook shims' rung-2 — placed AFTER
+        # pip-install so the recorded interpreter always points to an env where chinamaxM is
+        # installed (a pip-install failure aborts BEFORE this runs, so we never record a
+        # chinamaxM-less env; the shims fall to the slow `conda run` rung until a successful
+        # apply). Dead until setup writes it, else every hook spawn hits that slow rung.
+        steps.append(PlanStep(
+            id="record-python-path", kind="mutating", action="RECORD",
+            title="Record the chinamaxM env Python for the hook shims",
+            targets=[str(self._python_path_file())],
+            descriptor={"op": "record-python-path", "target": str(self._python_path_file())},
+            run=lambda e: e._apply_record_python_path(),
+        ))
+
         # (b) scaffold Key files (Codex only when the Codex home exists — ADR 0006).
         steps.append(self._scaffold_step("scaffold-claude-key", "Claude", self._claude_root / KEY_FILE_NAME))
         if codex_present:
@@ -668,11 +723,22 @@ class SetupEngine:
             ))
 
         # (d) service unit + install/update, then Linux linger.
+        service_title = "Write the Proxy service unit and install (or update) it"
+        service_descriptor = {
+            "op": "service", "entry": list(PROXY_ENTRY),
+            "port": self._registry.port, "log_dir": str(self._log_dir),
+        }
+        if self._platform.startswith("win"):
+            # Windows acquires WinSW; the source rides the descriptor so the digest binds it
+            # and the title so the plan render shows it (ADR 0009 as amended).
+            winsw = self._winsw_source()
+            service_descriptor["winsw"] = winsw
+            service_title += f" — WinSW source: {winsw['render']}"
         steps.append(PlanStep(
             id="service", kind="mutating", action="INSTALL/UPDATE",
-            title="Write the Proxy service unit and install (or update) it",
+            title=service_title,
             targets=[str(self._service_artifact_path())],
-            descriptor={"op": "service", "entry": list(PROXY_ENTRY), "port": self._registry.port, "log_dir": str(self._log_dir)},
+            descriptor=service_descriptor,
             run=lambda e: e._apply_service(),
         ))
         if self._platform.startswith("linux"):
@@ -789,6 +855,22 @@ class SetupEngine:
         self._conda.pip_install(self._plugin_root)
         return f"editable-installed the plugin into {CONDA_ENV}"
 
+    def _apply_record_python_path(self) -> str:
+        """Record the resolved env Python at ``<claude-root>/chinamaxM/python-path``.
+
+        This is the hook shims' rung-2 interpreter (a single ``<abs-python>\\n`` line);
+        without it every hook spawn falls to the slow ``conda run`` last resort. Written
+        atomically and skipped when byte-identical (idempotent; ADR 0009 / hosts-02 handoff).
+        """
+        from chinamaxM.generate import _atomic_write
+
+        target = self._python_path_file()
+        content = (self._conda.env_python_path() + "\n").encode("utf-8")
+        if target.exists() and target.read_bytes() == content:
+            return f"env Python already recorded at {target}"
+        _atomic_write(target, content)
+        return f"recorded env Python at {target}"
+
     def _apply_scaffold(self, path: Path, names: tuple[str, ...]) -> str:
         from chinamaxM.keyfiles import scaffold_key_file
 
@@ -810,15 +892,30 @@ class SetupEngine:
         return "Codex config validated (strict-config)"
 
     def _apply_service(self) -> str:
-        cfg = self._install_cfg()
+        winsw_exe_path = None
+        caveat = ""
+        if self._platform.startswith("win"):
+            # Acquire WinSW now (operator override → already-installed → pinned checksummed
+            # download); any acquisition failure raises SupervisionError and aborts this step.
+            service_dir = self._service_artifact_path().parent
+            winsw_exe_path = self._ensure_winsw(service_dir, self._winsw_exe)
+            if self._service_password is None:
+                # No --winsw-service-password-file: nothing sets sc.exe password=. The service
+                # account must be allowed to log on as a service (ADR 0009 as amended).
+                caveat = (
+                    " (no --winsw-service-password-file supplied; the service account must be "
+                    "allowed to log on as a service — a passwordless local account may fail to "
+                    "start the service)"
+                )
+        cfg = self._install_cfg(winsw_exe_path)
         rendered = self._service_render(cfg)
         path = Path(rendered.path)
         on_disk = path.read_bytes() if path.exists() else None
         if on_disk is not None and on_disk != rendered.content:
             self._service_update(cfg)
-            return "service updated (unit artifact changed)"
+            return "service updated (unit artifact changed)" + caveat
         self._service_install(cfg)
-        return "service installed, enabled, and started"
+        return "service installed, enabled, and started" + caveat
 
     def _apply_linger(self) -> str:
         self._enable_linger()
@@ -919,6 +1016,13 @@ class SetupEngine:
             descriptor={"op": "service-teardown", "port": self._registry.port},
             run=lambda e: e._apply_service_teardown(),
         ))
+        steps.append(PlanStep(
+            id="python-path-remove", kind="mutating", action="REMOVE",
+            title="Remove the recorded chinamaxM env Python path (hook shim rung-2)",
+            targets=[str(self._python_path_file())],
+            descriptor={"op": "remove-python-path", "target": str(self._python_path_file())},
+            run=lambda e: e._apply_remove_python_path(),
+        ))
         return steps
 
     def teardown(self, plan_digest: str) -> Report:
@@ -943,6 +1047,17 @@ class SetupEngine:
     def _apply_service_teardown(self) -> str:
         self._service_teardown(self._status_cfg())
         return "service uninstalled"
+
+    def _apply_remove_python_path(self) -> str:
+        """Remove the recorded env-Python file; an absent file is a no-op, never an error."""
+        target = self._python_path_file()
+        try:
+            target.unlink()
+            return f"removed {target}"
+        except FileNotFoundError:
+            return "no recorded python-path to remove"
+        except OSError as exc:
+            raise SetupError(f"could not remove {target}: {exc}") from exc
 
 
 # --------------------------------------------------------------------------- rendering
@@ -1044,6 +1159,22 @@ def render_report(report: Report) -> str:
 # --------------------------------------------------------------------------- CLI entry
 
 
+def _read_service_password(path: str) -> str:
+    """Read the Windows service-account password from a file (never shell history / logs).
+
+    Strips a trailing newline so a normal ``echo``-created file validates — a
+    SupervisionConfig rejects control characters (newline included) in the password.
+
+    Raises:
+        SetupError: If the file cannot be read.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SetupError(f"could not read --winsw-service-password-file {path!r}: {exc}") from exc
+    return text.rstrip("\r\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI: ``--plan-only`` (default) renders; ``--apply``/``--teardown`` need ``--plan-digest``."""
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -1059,9 +1190,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--teardown", action="store_true", help="plan/apply teardown (remove the flip + service)")
     parser.add_argument("--plan-digest", default=None, help="the digest printed by --plan-only")
     parser.add_argument("--probes", action="store_true", help="opt into live paid probes at apply time")
+    parser.add_argument(
+        "--winsw-exe", default=None,
+        help="Windows: an operator-supplied WinSW executable (overrides the pinned download)",
+    )
+    parser.add_argument(
+        "--winsw-service-password-file", default=None,
+        help="Windows: file holding the service-account password (read once, never logged)",
+    )
     args = parser.parse_args(argv)
 
-    engine = SetupEngine()
+    engine_kwargs: dict[str, object] = {}
+    if args.winsw_exe is not None:
+        engine_kwargs["winsw_exe"] = args.winsw_exe
+    if args.winsw_service_password_file is not None:
+        engine_kwargs["service_password"] = _read_service_password(args.winsw_service_password_file)
+    engine = SetupEngine(**engine_kwargs)
 
     if args.teardown:
         if args.plan_digest and not args.plan_only:

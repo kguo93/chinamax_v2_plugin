@@ -22,11 +22,13 @@ import pytest
 
 from chinamaxM.ops.supervision import (
     LOOPBACK_HOST,
+    WINSW_SHA256,
     RenderedArtifact,
     SupervisionConfig,
     SupervisionError,
     SupervisionStatus,
     enable_linger,
+    ensure_winsw_exe,
     install,
     linger_enabled,
     port_live,
@@ -435,6 +437,52 @@ def test_winsw_teardown_sc_delete_fallback(tmp_path, winsw_exe):
         ["sc.exe", "query", "chinamaxM"],
         ["sc.exe", "delete", "chinamaxM"],
     ]
+
+
+def test_ensure_winsw_exe(tmp_path, winsw_exe):
+    """Fix 2: override → already-installed → checksummed download, fail-closed on mismatch."""
+    service_dir = tmp_path / "service"
+    service_dir.mkdir()
+    installed = service_dir / "chinamaxM-service.exe"
+
+    def _forbid_download(url):
+        raise AssertionError("ensure_winsw_exe downloaded when it should not have")
+
+    # (a) override_path given → returned unchanged, no download, nothing placed at service_dir.
+    got = ensure_winsw_exe(service_dir, override_path=winsw_exe, downloader=_forbid_download)
+    assert got == winsw_exe
+    assert not installed.exists()
+
+    # a missing override → SupervisionError (still no download).
+    with pytest.raises(SupervisionError):
+        ensure_winsw_exe(service_dir, override_path=tmp_path / "nope.exe", downloader=_forbid_download)
+
+    # (b) an exe already at service_dir → returned, no download (idempotent, untouched).
+    installed.write_bytes(b"MZ-existing-winsw")
+    got_b = ensure_winsw_exe(service_dir, downloader=_forbid_download)
+    assert got_b == installed
+    assert installed.read_bytes() == b"MZ-existing-winsw"
+    installed.unlink()
+
+    # (c) absent → download bytes whose (injected) hash == WINSW_SHA256 → placed at service_dir.
+    payload = b"downloaded-winsw-bytes"
+    got_c = ensure_winsw_exe(
+        service_dir,
+        downloader=lambda url: payload,
+        hasher=lambda data: WINSW_SHA256,
+    )
+    assert got_c == installed
+    assert installed.read_bytes() == payload
+    installed.unlink()
+
+    # (d) checksum MISMATCH → SupervisionError, NO exe placed (fail closed).
+    with pytest.raises(SupervisionError):
+        ensure_winsw_exe(
+            service_dir,
+            downloader=lambda url: b"tampered-bytes",
+            hasher=lambda data: "0" * 64,
+        )
+    assert not installed.exists()
 
 
 # ---------------------------------------- test 4: distinct status primitives (AC-4)

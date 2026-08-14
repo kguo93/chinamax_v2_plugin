@@ -42,6 +42,11 @@ Removes ONLY the env flip and the service; keys, agents, and Linux linger are le
 
 - Concurrency: single-operator only — never run setup concurrently (no cross-process lock in v0.1).
 - No command path ever prints an API-key value; probe failures show only the parsed error type/message.
-- Windows (v0.1 limitation): setup does NOT yet provide a way to supply a WinSW executable,
-  so on Windows the service step FAILS and — per the pinned order — the env flip and probes
-  abort (the re-diagnose and report still run). Linux and macOS are fully supported.
+- Windows: supported. The service step acquires the WinSW wrapper automatically — it uses an
+  operator-supplied `--winsw-exe <path>` if given, else a WinSW exe already installed under the
+  service dir, else it downloads the pinned, SHA-256-verified official WinSW release (failing
+  CLOSED on any checksum mismatch — an unverified binary is never installed; auto-download
+  needs network at apply, and `--winsw-exe` is the offline escape hatch). Optionally add
+  `--winsw-service-password-file <path>` to supply the service-account password (read from the
+  file, never logged). NOTE: the Windows path is NOT live-verified on a real Windows host in
+  this build (mocked-tested only).

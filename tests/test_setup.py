@@ -422,6 +422,10 @@ def test_apply_failure_aborts_rest(tmp_path):
     outcomes = {r.id: r.status for r in report.step_results}
     assert outcomes["conda-env"] == "ok" and outcomes["pip-install"] == "failed"
     assert outcomes["generate"] == "aborted" and outcomes["env-flip"] == "aborted"
+    # record-python-path sits AFTER pip-install, so a pip failure aborts it: no python-path
+    # is recorded for a chinamaxM-less env.
+    assert outcomes["record-python-path"] == "aborted"
+    assert not (tmp_path / "claude" / "chinamaxM" / "python-path").exists()
     assert ctx["conda"].created == 1  # the successful create is NOT rolled back
     assert not (tmp_path / "claude" / "settings.json").exists()  # env flip never written
     assert report.after_findings  # re-diagnose still ran
@@ -580,3 +584,146 @@ def test_settings_json_fail_closed(tmp_path):
     settings_json.write_flip(fresh, FLIP_URL)
     assert json.loads(fresh.read_text())["env"]["ANTHROPIC_BASE_URL"] == FLIP_URL
     assert (fresh.stat().st_mode & 0o777) == 0o600
+
+
+# --------------------------------------------------------------- Fix 2: Windows WinSW
+
+
+def _real_exe(path: Path) -> Path:
+    """Create and return a stand-in resolved WinSW exe (an existing file SupervisionConfig accepts)."""
+    path.write_bytes(b"MZ-resolved-winsw")
+    return path
+
+
+def test_windows_winsw_plan_render_and_apply(tmp_path):
+    """Fix 2 (Windows): plan shows the WinSW source + binds it in the digest; apply installs it."""
+    (tmp_path / "claude").mkdir()
+    resolved = _real_exe(tmp_path / "winsw-resolved.exe")
+    ensure_calls: list = []
+
+    def fake_ensure(service_dir, override_path=None):
+        ensure_calls.append((str(service_dir), override_path))
+        return resolved
+
+    engine, ctx = make_engine(tmp_path, platform="windows", ensure_winsw=fake_ensure)
+
+    # No override and no installed exe ⇒ the plan's WinSW source is the pinned download.
+    plan = engine.build_plan()
+    text = render_plan(plan)
+    assert "download pinned WinSW v2.12.0 (sha256-verified)" in text
+    service_step = next(s for s in plan.steps if s.id == "service")
+    assert service_step.descriptor["winsw"]["kind"] == "download"  # bound in the digest
+
+    # Apply resolves WinSW and installs the service; no linger step on Windows.
+    report = engine.apply(plan.digest)
+    assert report.exit_code == 0, render_report(report)
+    assert ctx["service"].installs == 1 and ctx["service"].updates == 0
+    assert ensure_calls and ensure_calls[0][1] is None  # no override threaded
+    assert all(r.id != "linger" for r in report.step_results)
+    # No password supplied ⇒ the service step notes the logon-as-service caveat.
+    service_result = next(r for r in report.step_results if r.id == "service")
+    assert "log on as a service" in service_result.detail
+
+
+def test_windows_winsw_override_threaded(tmp_path):
+    """Fix 2 (Windows): --winsw-exe is shown in the plan and threaded to ensure_winsw_exe."""
+    (tmp_path / "claude").mkdir()
+    resolved = _real_exe(tmp_path / "winsw-resolved.exe")
+    ensure_calls: list = []
+
+    def fake_ensure(service_dir, override_path=None):
+        ensure_calls.append(override_path)
+        return resolved
+
+    override = str(tmp_path / "supplied" / "WinSW.exe")
+    # A supplied service password suppresses the caveat AND must never be rendered.
+    password = "PW-CANARY-do-not-log-7731"
+    engine, ctx = make_engine(
+        tmp_path, platform="windows", ensure_winsw=fake_ensure,
+        winsw_exe=override, service_password=password,
+    )
+
+    plan = engine.build_plan()
+    text = render_plan(plan)
+    assert f"supplied: {override}" in text
+    service_step = next(s for s in plan.steps if s.id == "service")
+    assert service_step.descriptor["winsw"] == {
+        "kind": "supplied", "path": override, "render": f"supplied: {override}"
+    }
+
+    report = engine.apply(plan.digest)
+    assert report.exit_code == 0, render_report(report)
+    assert ensure_calls == [override]  # the override threaded end-to-end
+    assert ctx["service"].installs == 1
+
+    service_result = next(r for r in report.step_results if r.id == "service")
+    assert "log on as a service" not in service_result.detail  # password supplied ⇒ no caveat
+    for rendered in (render_plan(plan), render_report(report)):
+        assert password not in rendered  # the password is NEVER logged
+
+
+def test_windows_winsw_acquisition_failure_aborts(tmp_path):
+    """Fix 2 (Windows): a WinSW acquisition failure fails the service step and aborts the rest."""
+    from chinamaxM.ops.supervision import SupervisionError
+
+    (tmp_path / "claude").mkdir()
+
+    def failing_ensure(service_dir, override_path=None):
+        raise SupervisionError(message="WinSW download checksum mismatch")
+
+    down = [
+        doctor.Finding("service", "fail", "fail", "service down"),
+        doctor.Finding("port", "fail", "fail", "port dead"),
+    ]
+    engine, ctx = make_engine(
+        tmp_path, platform="windows", ensure_winsw=failing_ensure, diagnose=lambda: list(down)
+    )
+    plan = engine.build_plan()
+    report = engine.apply(plan.digest, probes=True)
+
+    outcomes = {r.id: r.status for r in report.step_results}
+    assert outcomes["service"] == "failed"
+    assert outcomes["env-flip"] == "aborted"  # per the pinned order, the flip never runs
+    assert ctx["service"].installs == 0  # never installed
+    assert not (tmp_path / "claude" / "settings.json").exists()  # env flip never written
+    assert ctx["http"].requests == []  # probes not reached (skipped by the FAIL re-diagnose)
+    assert report.probes_skipped
+    assert report.after_findings and report.exit_code == 1  # re-diagnose + report still run
+
+
+# ----------------------------------------------------- Fix 5: hook shim python-path record
+
+
+def test_records_and_removes_python_path(tmp_path):
+    """Fix 5: apply records <root>/chinamaxM/python-path; plan-only doesn't; teardown removes it."""
+    (tmp_path / "claude").mkdir()
+    engine, ctx = make_engine(tmp_path)
+    py_file = tmp_path / "claude" / "chinamaxM" / "python-path"
+
+    # Plan renders the record step but writes nothing (it is a mutating op — no pre-approval run).
+    plan = engine.build_plan()
+    ids = [s.id for s in plan.steps]
+    # Ordered AFTER pip-install (so a plugin is present) and before the key scaffold.
+    assert ids.index("pip-install") < ids.index("record-python-path") < ids.index("scaffold-claude-key")
+    assert "Record the chinamaxM env Python" in render_plan(plan)
+    assert not py_file.exists()
+
+    # Apply records the resolved env python (FakeConda returns sys.executable) as one line.
+    report = engine.apply(plan.digest)
+    assert report.exit_code == 0, render_report(report)
+    assert py_file.read_text(encoding="utf-8") == sys.executable + "\n"
+
+    # Re-apply converges (byte-identical skip, still exit 0).
+    report2 = engine.apply(engine.build_plan().digest)
+    assert report2.exit_code == 0
+    assert py_file.read_text(encoding="utf-8") == sys.executable + "\n"
+
+    # Teardown removes the file; a second teardown (now absent) is a no-op, still exit 0.
+    report_td = engine.teardown(engine.build_teardown_plan().digest)
+    assert report_td.exit_code == 0
+    assert not py_file.exists()
+    assert {r.id: r.status for r in report_td.step_results}["python-path-remove"] == "ok"
+
+    report_td2 = engine.teardown(engine.build_teardown_plan().digest)
+    assert report_td2.exit_code == 0
+    assert {r.id: r.status for r in report_td2.step_results}["python-path-remove"] == "ok"

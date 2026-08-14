@@ -37,3 +37,21 @@ scope).**
 - **Identifier scope**: unit/plist/XML file names, `RunAtLoad=true`, and install paths
   are deliberately PLAN-level decisions (ops-01), not ADR policy; this ADR pins
   behavior (restart policies, service account, linger) only.
+
+**Amended 2026-08-14 (setup auto-acquires WinSW; reverses "operator-supplied only").** The
+v0.1 decision — recorded in `SupervisionConfig.winsw_exe_path` ("The operator-supplied WinSW
+executable (Windows only) … Never auto-downloaded (v0.1)") and in the Setup docs ("setup does
+NOT yet provide a way to supply a WinSW executable, so on Windows the service step FAILS") —
+is **reversed**: `/setup` now ACQUIRES WinSW automatically. The Windows service step resolves
+the WinSW exe in this order (idempotent, fails CLOSED): (1) an operator `--winsw-exe <path>`
+override (offline/custom hosts); (2) an exe already present at
+`<log_dir>/service/chinamaxM-service.exe` (a prior install — never re-downloaded); (3)
+otherwise download the PINNED official release (winsw v2.12.0 asset `WinSW-x64.exe`) and
+verify its SHA-256 against a hardcoded PUBLIC checksum — any mismatch or download failure
+aborts the service step with NO exe placed (an unverified binary is never installed; per the
+pinned apply order this also aborts the env flip + probes, while re-diagnose + report still
+run). An optional `--winsw-service-password-file <path>` supplies the service-account
+password (read once from the file, applied via `sc.exe config … password=`, never logged,
+never serialized into the XML — unchanged from the 2026-08-13 amendment). Auto-download needs
+network at apply; `--winsw-exe` is the offline escape hatch. This Windows path is
+mocked-tested only — it is NOT live-verified on a real Windows host in this build.
