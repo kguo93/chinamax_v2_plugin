@@ -122,11 +122,14 @@ def test_manifest_pinned_values() -> None:
     assert claude_plugin["description"] == SHARED_DESCRIPTION
     assert claude_plugin["author"] == AUTHOR
 
-    # Claude marketplace manifest — top-level {$schema, name, owner, plugins}; NO category.
+    # Claude marketplace manifest — top-level {$schema, name, description, owner, plugins};
+    # the top-level description silences `claude plugin validate`'s "No marketplace
+    # description provided" warning. NO category.
     claude_market = _load_json(CLAUDE_MARKETPLACE)
-    assert set(claude_market) == {"$schema", "name", "owner", "plugins"}
+    assert set(claude_market) == {"$schema", "name", "description", "owner", "plugins"}
     assert claude_market["$schema"] == "https://anthropic.com/claude-code/marketplace.schema.json"
     assert claude_market["name"] == "chinamaxm-plugin"
+    assert claude_market["description"] == SHARED_DESCRIPTION
     assert claude_market["owner"] == AUTHOR
     assert len(claude_market["plugins"]) == 1
     entry = claude_market["plugins"][0]
@@ -137,9 +140,12 @@ def test_manifest_pinned_values() -> None:
     assert entry["author"] == AUTHOR
     assert entry["source"] == "./"
 
-    # Codex plugin manifest — full metadata + preserved skills + interface block.
-    # NOTE: no top-level `hooks` key — the Codex plugin-creator validator rejects it;
-    # ./hooks/codex-hooks.json is default-discovered, so hosts-03's hooks stay registered.
+    # Codex plugin manifest — full metadata + preserved skills + the required hooks key +
+    # interface block.
+    # NOTE: the top-level `hooks` key is REQUIRED — real Codex auto-discovers only the fixed
+    # default `hooks/hooks.json`, so the Codex-flavored `./hooks/codex-hooks.json` must be
+    # named explicitly (ADR 0012 amended 2026-08-14). The bundled plugin-creator validator
+    # rejects the key but is demonstrably stricter than the real Codex CLI (not a gate).
     codex_plugin = _load_json(CODEX_PLUGIN)
     assert set(codex_plugin) == {
         "name",
@@ -150,9 +156,10 @@ def test_manifest_pinned_values() -> None:
         "license",
         "author",
         "skills",
+        "hooks",
         "interface",
     }
-    assert "hooks" not in codex_plugin
+    assert codex_plugin["hooks"] == "./hooks/codex-hooks.json"
     assert codex_plugin["name"] == "chinamaxm"
     assert codex_plugin["version"] == VERSION
     assert codex_plugin["description"] == SHARED_DESCRIPTION
@@ -251,6 +258,7 @@ def test_gitignore_covers_byproducts() -> None:
         "dist/",
         "*.swp",
         "*.swo",
+        "docs/plan/",
     }
     assert expected <= lines, expected - lines
 

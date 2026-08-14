@@ -21,6 +21,11 @@ codex plugin marketplace add kguo93/chinamax_v2_plugin
 codex plugin add chinamaxm@chinamaxm-plugin
 ```
 
+Validation note: `claude plugin validate` exits 0. Under `--strict` it emits one expected,
+benign warning — "CLAUDE.md at the plugin root is not loaded as project context" — because
+the repo-root `CLAUDE.md` is this project's dev-conventions file, not plugin runtime context;
+it does not gate installation (see ADR 0012).
+
 ## Upgrade
 
 On Claude Code:

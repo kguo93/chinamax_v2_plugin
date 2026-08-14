@@ -9,6 +9,7 @@
     "name": "Kevin Guo"
   },
   "skills": "./skills",
+  "hooks": "./hooks/codex-hooks.json",
   "interface": {
     "displayName": "ChinamaXM",
     "shortDescription": "Worker models as native subagents",

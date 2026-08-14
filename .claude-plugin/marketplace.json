@@ -1,6 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "chinamaxm-plugin",
+  "description": "Expose non-Claude worker models as native subagents of Claude Code and Codex, routed through one local Proxy.",
   "owner": {
     "name": "Kevin Guo"
   },

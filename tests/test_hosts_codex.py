@@ -329,15 +329,15 @@ def test_surface_symmetry_with_claude():
 
 
 def test_codex_manifest_registered():
-    """AC-6: skills registered; codex-hooks.json default-discovered with live, expandable shims."""
+    """AC-6: skills + the required hooks key registered, with live, expandable shims."""
     plugin = json.loads(CODEX_PLUGIN_JSON.read_text(encoding="utf-8"))
     assert plugin["skills"] == "./skills"
-    # The Codex plugin-creator validator rejects a top-level `hooks` key, so codex-hooks.json
-    # is default-discovered at ./hooks/codex-hooks.json instead — hosts-03's hooks stay
-    # registered without the (now-invalid) manifest pointer.
-    assert "hooks" not in plugin
+    # Real Codex auto-discovers only the fixed default `hooks/hooks.json`, so the manifest MUST
+    # name the Codex-flavored hook file explicitly (ADR 0012 amended 2026-08-14). The bundled
+    # plugin-creator validator rejects the key but is not the authority — real Codex is.
+    assert plugin["hooks"] == "./hooks/codex-hooks.json"
 
-    # Resolve the hook manifest at its default-discovery location.
+    # Resolve the declared hook manifest.
     hooks_path = CODEX_HOOKS_JSON
     assert hooks_path.exists(), hooks_path
     hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
