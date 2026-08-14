@@ -30,8 +30,9 @@ import tomllib
 from pathlib import Path
 from typing import Iterable, Literal, Mapping
 
-import tomlkit
-import yaml
+# ``tomlkit`` and ``yaml`` are imported LAZILY inside the functions that serialize/parse
+# TOML/YAML — never at module load — so a consumer running under a bare ambient interpreter
+# that lacks these env-only deps (setup.py's Bootstrap contract) can import this module.
 
 from .keyfiles import resolve_host_root
 from .registry import Profile, Registry, load_registry
@@ -148,6 +149,8 @@ def _config_path(roots: Mapping[str, Path]) -> Path:
 
 def _yaml_model_line(value: str) -> str:
     """Serialize a single ``model:`` frontmatter line (no trailing newline)."""
+    import yaml  # lazy (Bootstrap): env-only dep, never imported at module load
+
     dumped = yaml.safe_dump(
         {"model": value},
         sort_keys=False,
@@ -165,6 +168,8 @@ def _claude_agent_content(profile: Profile) -> str:
     when the Profile overrides it (a null ``tools`` omits the key so the host grants its
     standard set). All scalars pass through the YAML serializer for correct escaping.
     """
+    import yaml  # lazy (Bootstrap): env-only dep, never imported at module load
+
     front: dict[str, object] = {
         "name": profile.name,
         "description": f"chinamaxM worker on {profile.name}",
@@ -189,6 +194,8 @@ def _codex_role_content(profile: Profile) -> str:
     ``model_context_window`` (only when the Registry pins one for the default model), then
     ``developer_instructions``. ``model_reasoning_effort`` is never emitted (ADR 0004).
     """
+    import tomlkit  # lazy (Bootstrap): env-only dep, never imported at module load
+
     doc = tomlkit.document()
     doc.add(tomlkit.comment(CODEX_MARKER[2:]))
     doc["name"] = profile.name
@@ -329,6 +336,8 @@ def _extract_claude_model(text: str) -> str | None:
     open_index, close_index = bounds
     for line in lines[open_index + 1 : close_index]:
         if line.startswith("model:"):
+            import yaml  # lazy (Bootstrap): env-only dep, never imported at module load
+
             try:
                 return yaml.safe_load(line)["model"]
             except Exception:
@@ -389,6 +398,8 @@ def _rewrite_codex_model_line(text: str, value: str) -> str:
 
     The tomlkit round-trip preserves every other byte and escapes the value.
     """
+    import tomlkit  # lazy (Bootstrap): env-only dep, never imported at module load
+
     doc = tomlkit.parse(text)
     doc["model"] = value
     return tomlkit.dumps(doc)
@@ -461,6 +472,8 @@ def _parse_config_or_raise(config_path: Path) -> tomlkit.TOMLDocument | None:
         GenerationError: If the file cannot be read or parsed, if ``model_providers`` is
             not a table, or if any ``chinamaxM-`` entry is not a table.
     """
+    import tomlkit  # lazy (Bootstrap): env-only dep, never imported at module load
+
     if not config_path.exists():
         return None
     try:
@@ -500,6 +513,8 @@ def _reconcile_providers(
     Returns:
         ``(written, skipped, pruned)`` lists of provider labels.
     """
+    import tomlkit  # lazy (Bootstrap): env-only dep, never imported at module load
+
     expected = expected_providers(registry)
     written: list[str] = []
     skipped: list[str] = []
@@ -654,6 +669,8 @@ def regenerate(registry: Registry, roots: Mapping[str, Path]) -> dict[str, list[
     Raises:
         GenerationError: On any preflight fault (before any write occurs).
     """
+    import tomlkit  # lazy (Bootstrap): env-only dep, never imported at module load
+
     _validate_profile_names(registry)
     config_path = _config_path(roots)
     config_doc = _parse_config_or_raise(config_path)
