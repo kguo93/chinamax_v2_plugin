@@ -1,57 +1,175 @@
-# chinamax_v2_plugin
-Use native chinese ai agents natively inside claude code/codex harness
+# chinamaxM
+Use Chinese AI models — DeepSeek, MiMo, GLM, MiniMax, Kimi, Qwen — as native
+background subagents inside Claude Code or Codex.
 
-## Install
+Every worker request goes through one small local reverse proxy that routes it to the
+right provider. Claude itself is untouched and keeps talking straight to Anthropic. The M
+stands for improved.
 
-chinamaxM is distributed from its GitHub repository. Add the marketplace, then install the
-plugin on whichever Host you use. The install identifier is the same on both Hosts:
-`chinamaxm@chinamaxm-plugin`.
+## Requirements
 
-### Claude Code
+- **Conda — installed for you if missing.** Setup builds a dedicated `chinamaxM` conda env
+  (Python 3.12) for the proxy. If `conda` is missing, setup installs Miniconda for you on
+  approval (it downloads the official installer and runs `conda init`, which edits your shell
+  startup files). You only need conda pre-installed on unsupported CPU architectures, where
+  setup falls back to telling you to install Miniconda yourself.
+- **Claude Code and/or Codex** — the plugin installs on either host.
+- Linux, macOS, or Windows.
 
+## Commands on both hosts
+
+Every command below is a Claude Code slash command. On Codex the same thing exists as a
+skill with the same name and arguments, just without the leading slash:
+
+| Claude Code | Codex |
+|---|---|
+| `/chinamaxM:setup` | `chinamaxM-setup` skill |
+| `/chinamaxM:task` | `chinamaxM-task` skill |
+| `/chinamaxM:doctor` | `chinamaxM-doctor` skill |
+| `/chinamaxM:profiles` | `chinamaxM-profiles` skill |
+
+The rest of this README uses the Claude Code form.
+
+## 1. Install the plugin
+
+chinamaxM ships from GitHub. Add the marketplace, then install. The install id is the same
+on both hosts: `chinamaxm@chinamaxm-plugin`. GitHub is the only install/update source on
+both hosts — the `origin` git remote is only an rpi4 git backup mirror, never an install
+source.
+
+**Claude Code**
 ```
 claude plugin marketplace add kguo93/chinamax_v2_plugin
 claude plugin install chinamaxm@chinamaxm-plugin
 ```
 
-### Codex
-
+**Codex**
 ```
 codex plugin marketplace add kguo93/chinamax_v2_plugin
 codex plugin add chinamaxm@chinamaxm-plugin
 ```
 
-Validation note: `claude plugin validate` exits 0. Under `--strict` it emits one expected,
-benign warning — "CLAUDE.md at the plugin root is not loaded as project context" — because
-the repo-root `CLAUDE.md` is this project's dev-conventions file, not plugin runtime context;
-it does not gate installation (see ADR 0012).
+## 2. Run setup
+
+Installing only adds the commands. `/chinamaxM:setup` wires everything up. It is the only
+command that changes your machine, and it changes **nothing** until you approve. It runs in
+two passes:
+
+1. **Plan.** It inspects your install and prints an ordered list of every change it wants
+   to make, plus a plan digest. Nothing is touched yet.
+2. **Apply.** After you approve, it applies that exact plan. In one pass it:
+   - installs Miniconda for you if `conda` is missing (downloads the official installer and
+     runs `conda init`, which edits your shell startup files),
+   - creates the `chinamaxM` conda env and installs the proxy into it,
+   - scaffolds your API-key file (empty, comments only),
+   - generates one worker subagent per model,
+   - installs the proxy as a self-restarting OS service (see below),
+   - points `ANTHROPIC_BASE_URL` at the local proxy so worker requests get routed.
+
+You get two separate yes/no questions: approve the plan, and — optionally — run live paid
+probes that send one tiny real request per model to confirm the keys work. Probes spend a
+few tokens, so they are off unless you opt in.
+
+When setup finishes, **restart any open host sessions** so the new worker subagents load.
+
+Re-running setup is safe — it only fills in what is missing.
+
+## 3. Add your API keys
+
+Each worker needs its provider's key. Setup creates a per-host key file with the lines
+commented out; you fill in the values. The file is never committed, and the proxy is the
+only thing that reads it.
+
+- Claude Code: `~/.claude/model-keys.env`
+- Codex: `~/.codex/model-keys.env`
+
+```
+DEEPSEEK_API_KEY=...
+GLM_API_KEY=...
+```
+
+Only fill in the models you will actually use. `/chinamaxM:profiles` shows which keys are
+present (PRESENT/MISSING — never the value).
+
+## How the proxy stays alive (per OS)
+
+Setup installs the proxy as a background OS service that restarts itself after a crash, so
+you never babysit it. The mechanism differs by OS:
+
+| OS | Mechanism | Survives reboot? |
+|---|---|---|
+| Linux | systemd **user** service (`Restart=always`); setup also enables `loginctl` linger | Yes, even headless |
+| macOS | launchd LaunchAgent (`KeepAlive=true`) | Starts when you next log in |
+| Windows | Windows Service via WinSW, running as your user | Yes |
+
+On Windows, setup fetches WinSW automatically (a pinned, checksum-verified official
+release) or uses one you point it at with `--winsw-exe`. The Windows path is tested but not
+yet verified on a live Windows box — treat it as beta.
+
+## Launch a task
+
+Dispatch a task to a worker. It runs as a **named background subagent**; when it finishes,
+its report is printed straight back to you.
+
+```
+/chinamaxM:task profile=deepseek <your prompt>
+```
+
+Arguments:
+- `profile=<name>` — **required**. One of: `deepseek`, `mimo`, `glm`, `minimax`, `kimi`,
+  `qwen`.
+- `model=<any string>` — optional. Overrides the profile's default model. The string goes
+  straight to the provider and is never checked, so a typo comes back as the provider's own
+  error.
+- `name=<worker>` — optional. Must start with `<profile>-` (e.g. `deepseek-review`).
+  Defaults to `deepseek-1`, `deepseek-2`, …
+
+Examples:
+```
+/chinamaxM:task profile=deepseek summarize the diff on this branch
+/chinamaxM:task profile=glm model=glm-4-plus name=glm-tests write tests for utils.py
+```
+
+## Steer and continue a worker
+
+While the session that launched it is alive, a worker stays addressable by its name. Just
+tell the host in plain language:
+
+- Mid-run: "tell deepseek-1 to also cover the error paths."
+- After it finishes: "ask deepseek-1 to now write the tests" — it picks up with full
+  context.
+
+Same experience on both hosts. (On Codex the host relays your message to the worker behind
+the scenes, because Codex won't let you message a child directly — you don't have to think
+about it.)
+
+## Resume across sessions
+
+There is none, by design. A worker lives and dies with the session that spawned it. Once
+that session ends, the worker is gone — dispatch a fresh one from the new session.
+
+## Check the install
+
+- `/chinamaxM:doctor` — checks everything read-only and free: conda env, dependencies,
+  service running, port live. Never spends tokens. If it can't even launch (no conda, no
+  env), that failure *is* the diagnosis — run setup.
+- `/chinamaxM:profiles` — lists each model, its default, and which keys are set.
 
 ## Upgrade
 
-On Claude Code:
-
+**Claude Code**
 ```
 claude plugin update chinamaxm@chinamaxm-plugin
 ```
 
-On Codex there is no per-plugin update subcommand — refresh the marketplace snapshot, then
-re-add:
-
+**Codex** — no per-plugin update; refresh the marketplace and re-add:
 ```
 codex plugin marketplace upgrade
 codex plugin add chinamaxm@chinamaxm-plugin
 ```
 
-GitHub is the only canonical marketplace source for both Hosts. The `origin` remote is an
-rpi4 git backup mirror only and is never an install or update source.
+## Uninstall / teardown
 
-## API keys
-
-Worker-model keys live in a per-Host env file (`~/.claude/model-keys.env`,
-`~/.codex/model-keys.env`), one line per provider. Set each value yourself; the files are
-never committed:
-
-```
-DEEPSEEK_API_KEY=
-GLM_API_KEY=
-```
+Run `/chinamaxM:setup` and choose teardown. It removes the `ANTHROPIC_BASE_URL` flip and
+the proxy service; it leaves your keys, generated agents, and Linux linger in place. Like
+setup, it shows a plan and waits for your approval before touching anything.
