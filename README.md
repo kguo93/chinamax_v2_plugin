@@ -8,11 +8,16 @@ stands for improved.
 
 ## Requirements
 
-- **Conda — installed for you if missing.** Setup builds a dedicated `chinamaxM` conda env
-  (Python 3.12) for the proxy. If `conda` is missing, setup installs Miniconda for you on
-  approval (it downloads the official installer and runs `conda init`, which edits your shell
-  startup files). You only need conda pre-installed on unsupported CPU architectures, where
-  setup falls back to telling you to install Miniconda yourself.
+- **Prerequisites installed for you, on approval.** Setup DETECTS the platform tools it needs —
+  `bash`, Miniconda (a dedicated `chinamaxM` Python 3.12 conda env runs the proxy), and, on
+  Windows, Git for Windows (its Git Bash is what the Codex hooks use). If any is missing, setup
+  PAUSES and shows you the exact install commands — nothing is installed until you type
+  `approve`, and setup then runs them for you. A `miniconda` step runs `conda init`, which edits
+  your shell startup files. On unsupported CPU architectures setup falls back to telling you to
+  install Miniconda yourself.
+- **No pre-installed Python needed.** Setup does not require an existing Python — on a bare
+  Windows box it bootstraps Git for Windows and Miniconda straight from `cmd.exe` (winget + the
+  official Miniconda installer), then continues.
 - **Claude Code and/or Codex** — the plugin installs on either host.
 - Linux, macOS, or Windows.
 
@@ -52,14 +57,18 @@ codex plugin add chinamaxm@chinamaxm-plugin
 ## 2. Run setup
 
 Installing only adds the commands. `/chinamaxM:setup` wires everything up. It is the only
-command that changes your machine, and it changes **nothing** until you approve. It runs in
-two passes:
+command that changes your machine, and it changes **nothing** until you approve.
+
+**Prerequisites first.** If a platform tool is missing (`bash`, Miniconda, or — on Windows —
+Git for Windows), setup pauses and shows you the exact install commands. Reply `approve` and it
+runs them for you in order (stopping on the first failure), then re-checks. The engine never
+downloads or runs an installer on its own — you approve each step.
+
+Once the prerequisites are in place, setup runs in two passes:
 
 1. **Plan.** It inspects your install and prints an ordered list of every change it wants
    to make, plus a plan digest. Nothing is touched yet.
 2. **Apply.** After you approve, it applies that exact plan. In one pass it:
-   - installs Miniconda for you if `conda` is missing (downloads the official installer and
-     runs `conda init`, which edits your shell startup files),
    - creates the `chinamaxM` conda env and installs the proxy into it,
    - scaffolds your API-key file (empty, comments only),
    - generates one worker subagent per model,

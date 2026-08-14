@@ -19,9 +19,7 @@ import pytest
 from chinamaxM import doctor, settings_json
 from chinamaxM.ops.supervision import SupervisionStatus
 from chinamaxM.setup import (
-    _CONDA_INIT_TIMEOUT,
-    _MINICONDA_DL_TIMEOUT,
-    _MINICONDA_INSTALL_TIMEOUT,
+    _GIT_FOR_WINDOWS_URL,
     ProbeResponse,
     SetupEngine,
     SetupError,
@@ -178,6 +176,18 @@ def make_engine(tmp_path, **overrides):
     port_live = overrides.pop("port_live", None) or (lambda port: True)
     platform = overrides.pop("platform", "linux")
 
+    # Default: every Platform Prerequisite present, so the normal mutating plan is exercised
+    # hermetically (independent of the host's real bash/git/conda). Tests that want the
+    # Phase-A pause pass an explicit ``prerequisites`` returning a dict with a missing tool.
+    prerequisites = overrides.pop("prerequisites", None)
+    if prerequisites is None:
+        present = (
+            {"git": True, "bash": True, "cygpath": True, "miniconda": True}
+            if platform.startswith("win")
+            else {"bash": True, "miniconda": True}
+        )
+        prerequisites = lambda snapshot=dict(present): dict(snapshot)
+
     engine = SetupEngine(
         claude_root=str(claude),
         codex_root=str(codex),
@@ -185,6 +195,7 @@ def make_engine(tmp_path, **overrides):
         run=overrides.pop("run", None) or _ok_run,
         conda=conda,
         diagnose=diagnose,
+        prerequisites=prerequisites,
         generate_fn=lambda reg, roots, inc: _run_generation(reg, roots, include_codex=inc),
         service_status=service.status,
         service_install=service.install,
@@ -751,151 +762,246 @@ def test_records_and_removes_python_path(tmp_path):
     assert {r.id: r.status for r in report_td2.step_results}["python-path-remove"] == "ok"
 
 
-# ------------------------------------------------------- Conda bootstrap (Miniconda auto-install)
+# ------------------------------------------ Platform prerequisites (detect + emit rows, no self-install)
+#
+# The engine only DETECTS prerequisites (bash / Git for Windows / Miniconda) and EMITS
+# agent-run Rectification rows; the Host runs them on approval (ADR 0009 as amended
+# 2026-08-14). The engine NEVER downloads or runs an installer. These pins carry the exact
+# command/flag/shell/run_policy strings ported from the old plugin's ``doctor``. Each engine
+# is built via ``make_engine`` for the target Platform, and the row builders are exercised
+# directly so ``shutil.which`` (package-manager / winget / brew detection) is monkeypatched.
 
 
-def _bootstrap_step(plan):
-    return next(s for s in plan.steps if s.id == "conda-bootstrap")
+def _prereq_engine(tmp_path, platform, machine="x86_64"):
+    """A SetupEngine on the target Platform whose prerequisite row builders can be driven."""
+    engine, _ctx = make_engine(tmp_path, platform=platform, machine=machine, home=tmp_path)
+    return engine
+
+
+def test_prerequisite_status_present_no_pause(tmp_path):
+    """Every Prerequisite present ⇒ build_plan emits the normal mutating plan + a digest."""
+    engine, _ctx = make_engine(tmp_path)  # make_engine defaults all prerequisites present
+    plan = engine.build_plan()
+    assert plan.prerequisite_fixes == []
+    assert plan.digest and plan.steps
+    assert "Plan digest:" in render_plan(plan)
+
+
+def test_prerequisite_status_windows_probes_git_tree(tmp_path, monkeypatch):
+    """Windows status probes the Git for Windows install tree on disk first, then PATH."""
+    from chinamaxM import setup as setup_mod
+
+    git_root = tmp_path / "Program Files" / "Git"
+    for rel in ("cmd/git.exe", "bin/bash.exe", "usr/bin/cygpath.exe"):
+        p = git_root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("")
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "Program Files"))
+    for var in ("ProgramW6432", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda name: None)  # no PATH fallback
+    engine, _ctx = make_engine(
+        tmp_path, platform="windows", conda=FakeConda(available=True),
+    )
+    status = engine._prerequisite_status()
+    assert status == {"git": True, "bash": True, "cygpath": True, "miniconda": True}
+    # Emission order: the Git trio precedes miniconda (its conda init needs bash).
+    assert list(status) == ["git", "bash", "cygpath", "miniconda"]
+
+    # cygpath absent on disk AND off PATH ⇒ reported missing.
+    (git_root / "usr/bin/cygpath.exe").unlink()
+    assert engine._prerequisite_status()["cygpath"] is False
+
+
+def test_prerequisite_status_windows_ignores_path_bash(tmp_path, monkeypatch):
+    """A bash/git/cygpath on PATH (e.g. WSL's System32 bash) must NOT satisfy the Windows
+    requirement — only the Git for Windows install tree does, since the Codex shim runs Git
+    Bash specifically. This pins the fix: no `shutil.which` PATH fallback on Windows."""
+    from chinamaxM import setup as setup_mod
+
+    # No Git for Windows install tree: clear the root env vars so none resolves on disk.
+    for var in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(var, raising=False)
+    # ...but every tool DOES resolve on PATH (a WSL bash + stray git/cygpath). Must be IGNORED.
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda name: rf"C:\Windows\System32\{name}.exe")
+
+    engine, _ctx = make_engine(tmp_path, platform="windows", conda=FakeConda(available=True))
+    status = engine._prerequisite_status()
+    assert status == {"git": False, "bash": False, "cygpath": False, "miniconda": True}
+    # The pause therefore emits the Git for Windows row (bash/cygpath come from Git for Windows).
+    rows = engine._prerequisite_fixes(status)
+    assert rows[0]["name"] == "Git for Windows"
+    assert set(rows[0]["missing_tools"]) == {"git", "bash", "cygpath"}
 
 
 @pytest.mark.parametrize(
-    "platform,machine,os_tag,arch,init_shells",
+    "manager,command",
     [
-        ("linux", "x86_64", "Linux", "x86_64", ["bash"]),
-        ("linux", "aarch64", "Linux", "aarch64", ["bash"]),
-        ("darwin", "arm64", "MacOSX", "arm64", ["bash", "zsh"]),
+        ("apt-get", "sudo apt-get install -y bash"),
+        ("dnf", "sudo dnf install -y bash"),
+        ("yum", "sudo yum install -y bash"),
+        ("pacman", "sudo pacman -S --noconfirm bash"),
+        ("zypper", "sudo zypper install -y bash"),
+        ("apk", "sudo apk add bash"),
     ],
 )
-def test_conda_bootstrap_posix_plan_emission(tmp_path, platform, machine, os_tag, arch, init_shells):
-    """conda absent ⇒ a BOOTSTRAP step whose descriptor is the exact per-OS installer plan."""
+def test_prerequisite_fixes_linux_bash_package_managers(tmp_path, monkeypatch, manager, command):
+    """Linux bash row: first package manager on PATH, privileged sudo policy, bash shell."""
+    from chinamaxM import setup as setup_mod
+
+    monkeypatch.setattr(
+        setup_mod.shutil, "which", lambda n: f"/usr/bin/{n}" if n == manager else None
+    )
+    rows = _prereq_engine(tmp_path, "linux")._prerequisite_fixes({"bash": False})
+    assert rows[0]["commands"] == [command]
+    assert rows[0]["run_policy"] == "privileged" and rows[0]["shell"] == "bash"
+    assert rows[0]["install_location"] == "system package manager"
+
+
+@pytest.mark.parametrize("machine", ["x86_64", "aarch64"])
+def test_prerequisite_fixes_linux_bash_and_miniconda(tmp_path, monkeypatch, machine):
+    """Linux emits bash BEFORE miniconda; the miniconda row is the exact 3-command sh install."""
+    from chinamaxM import setup as setup_mod
+
+    monkeypatch.setattr(
+        setup_mod.shutil, "which", lambda n: "/usr/bin/apt-get" if n == "apt-get" else None
+    )
+    rows = _prereq_engine(tmp_path, "linux", machine)._prerequisite_fixes(
+        {"bash": False, "miniconda": False}
+    )
+    assert [r["name"] for r in rows] == ["bash", "miniconda"]  # bash before miniconda
+    bash_row, mini = rows
+    assert bash_row["commands"] == ["sudo apt-get install -y bash"]
+    url = f"https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-{machine}.sh"
+    assert mini["commands"] == [
+        f'curl -fsSL {url} -o "$HOME/.chinamaxM-miniconda.sh"',
+        'bash "$HOME/.chinamaxM-miniconda.sh" -b -u -p "$HOME/miniconda3"',
+        '"$HOME/miniconda3/bin/conda" init bash',
+    ]
+    assert mini["run_policy"] == "agent" and mini["shell"] == "bash"
+    assert mini["install_location"] == "$HOME/miniconda3"
+    assert len(mini["commands"]) == 3  # no rm/cleanup line
+    assert not any(c.startswith("rm ") for c in mini["commands"])
+
+    # No package manager ⇒ advice-only bash row.
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda n: None)
+    rows = _prereq_engine(tmp_path, "linux", machine)._prerequisite_fixes({"bash": False})
+    assert rows[0]["run_policy"] == "operator" and rows[0]["commands"] == []
+
+
+def test_prerequisite_fixes_darwin(tmp_path, monkeypatch):
+    """macOS emits bash (brew) BEFORE miniconda; conda init runs both bash and zsh."""
+    from chinamaxM import setup as setup_mod
+
+    monkeypatch.setattr(
+        setup_mod.shutil, "which", lambda n: "/opt/homebrew/bin/brew" if n == "brew" else None
+    )
+    rows = _prereq_engine(tmp_path, "darwin", "arm64")._prerequisite_fixes(
+        {"bash": False, "miniconda": False}
+    )
+    assert [r["name"] for r in rows] == ["bash", "miniconda"]
+    bash_row, mini = rows
+    assert bash_row["commands"] == ["brew install bash"] and bash_row["run_policy"] == "agent"
+    assert bash_row["install_location"] == "Homebrew"
+    assert "Miniconda3-latest-MacOSX-arm64.sh" in mini["commands"][0]
+    assert mini["commands"][2] == '"$HOME/miniconda3/bin/conda" init bash zsh'
+    assert len(mini["commands"]) == 3
+
+    # x86_64 installer name.
+    rows = _prereq_engine(tmp_path, "darwin", "x86_64")._prerequisite_fixes({"miniconda": False})
+    assert "Miniconda3-latest-MacOSX-x86_64.sh" in rows[0]["commands"][0]
+
+    # brew absent ⇒ advice-only bash row naming Homebrew.
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda n: None)
+    rows = _prereq_engine(tmp_path, "darwin", "arm64")._prerequisite_fixes({"bash": False})
+    assert rows[0]["run_policy"] == "operator" and rows[0]["commands"] == []
+    assert "brew install bash" in rows[0]["summary"] and "Homebrew" in rows[0]["summary"]
+
+
+def test_prerequisite_fixes_windows(tmp_path, monkeypatch):
+    """Windows emits the deduped Git for Windows row BEFORE miniconda; winget present vs absent."""
+    from chinamaxM import setup as setup_mod
+
+    # winget present ⇒ one winget install line, run natively.
+    monkeypatch.setattr(
+        setup_mod.shutil, "which", lambda n: r"C:\winget.exe" if n == "winget" else None
+    )
+    rows = _prereq_engine(tmp_path, "windows")._prerequisite_fixes(
+        {"git": False, "bash": False, "cygpath": False, "miniconda": False}
+    )
+    assert [r["name"] for r in rows] == ["Git for Windows", "miniconda"]  # git before miniconda
+    git_row, mini = rows
+    assert git_row["missing_tools"] == ["git", "bash", "cygpath"]
+    assert git_row["commands"] == [
+        "winget install --id Git.Git -e --silent "
+        "--accept-source-agreements --accept-package-agreements"
+    ]
+    assert git_row["run_policy"] == "agent" and git_row["shell"] == "native"
+    assert git_row["install_location"] == r"Program Files\Git"
+    assert mini["shell"] == "cmd" and mini["install_location"] == r"%USERPROFILE%\miniconda3"
+    assert mini["commands"] == [
+        r'curl.exe -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe '
+        r'-o "%TEMP%\chinamaxM-miniconda.exe"',
+        r'start /wait "" "%TEMP%\chinamaxM-miniconda.exe" /InstallationType=JustMe '
+        r'/RegisterPython=0 /AddToPath=0 /S /D=%USERPROFILE%\miniconda3',
+        r'"%USERPROFILE%\miniconda3\Scripts\conda.exe" init cmd.exe powershell bash',
+    ]
+    assert len(mini["commands"]) == 3  # no del/cleanup line
+    assert not any(c.startswith("del ") for c in mini["commands"])
+
+    # winget absent ⇒ fail-loud PowerShell fallback naming the manual Git-for-Windows URL.
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda n: None)
+    rows = _prereq_engine(tmp_path, "windows")._prerequisite_fixes(
+        {"git": False, "bash": False, "cygpath": False}
+    )
+    git_row = rows[0]
+    assert git_row["shell"] == "powershell"
+    assert git_row["install_location"] == r"%LocalAppData%\Programs\Git"
+    assert _GIT_FOR_WINDOWS_URL in git_row["summary"]
+    cmd = git_row["commands"][0]
+    assert cmd.startswith("powershell -NoProfile -Command")
+    assert "$ErrorActionPreference='Stop'" in cmd
+    assert "-PassThru" in cmd and "exit $p.ExitCode" in cmd
+
+
+@pytest.mark.parametrize(
+    "platform,machine",
+    [("linux", "ppc64le"), ("linux", "s390x"), ("darwin", "ppc")],
+)
+def test_prerequisite_fixes_unsupported_arch_is_advice_only(tmp_path, monkeypatch, platform, machine):
+    """A POSIX arch off the map ⇒ advice-only miniconda row, no installer filename in the summary."""
+    from chinamaxM import setup as setup_mod
+
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda n: None)
+    rows = _prereq_engine(tmp_path, platform, machine)._prerequisite_fixes({"miniconda": False})
+    assert rows[0]["name"] == "miniconda"
+    assert rows[0]["commands"] == [] and rows[0]["run_policy"] == "operator"
+    # Names the base URL for a manual install, never a 404-bound installer filename.
+    assert "repo.anaconda.com/miniconda/" in rows[0]["summary"]
+    assert "Miniconda3-latest" not in rows[0]["summary"]
+
+
+def test_plan_only_pauses_on_missing_prerequisite(tmp_path):
+    """Phase-A pause: a missing Prerequisite ⇒ plan carries prerequisite_fixes, NO steps, NO digest."""
     engine, _ctx = make_engine(
-        tmp_path, conda=FakeConda(available=False),
-        platform=platform, machine=machine, home=tmp_path,
+        tmp_path, machine="x86_64",
+        prerequisites=lambda: {"bash": True, "miniconda": False},
     )
     plan = engine.build_plan()
-    step = _bootstrap_step(plan)
-    prefix = tmp_path / "miniconda3"
-    installer = tmp_path / ".chinamaxM-miniconda.sh"
-    url = f"https://repo.anaconda.com/miniconda/Miniconda3-latest-{os_tag}-{arch}.sh"
-    assert step.action == "BOOTSTRAP"
-    assert step.descriptor["url"] == url
-    assert step.descriptor["prefix"] == str(prefix)
-    assert step.descriptor["commands"] == [
-        ["curl", "-fsSL", url, "-o", str(installer)],
-        ["bash", str(installer), "-b", "-u", "-p", str(prefix)],
-        [str(prefix / "bin" / "conda"), "init", *init_shells],
-    ]
-    # The env cannot exist yet ⇒ a CREATE step follows the bootstrap.
-    ids = [s.id for s in plan.steps]
-    assert ids.index("conda-bootstrap") < ids.index("conda-env")
-    assert next(s for s in plan.steps if s.id == "conda-env").action == "CREATE"
-
-
-def test_conda_bootstrap_windows_plan_emission(tmp_path):
-    """Windows (machine AMD64): the exact curl.exe/JustMe-silent/conda-init argv, x86_64 asset."""
-    engine, _ctx = make_engine(
-        tmp_path, conda=FakeConda(available=False),
-        platform="windows", machine="AMD64", home=tmp_path,
+    assert plan.steps == [] and plan.digest == ""
+    assert any(r["name"] == "miniconda" for r in plan.prerequisite_fixes)
+    assert any(
+        "Miniconda3-latest-Linux-x86_64.sh" in c
+        for r in plan.prerequisite_fixes
+        for c in r["commands"]
     )
-    plan = engine.build_plan()
-    step = _bootstrap_step(plan)
-    prefix = tmp_path / "miniconda3"
-    installer = tmp_path / "chinamaxM-miniconda.exe"
-    url = "https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe"
-    assert step.action == "BOOTSTRAP"
-    assert step.descriptor["url"] == url
-    assert step.descriptor["commands"] == [
-        ["curl.exe", "-fsSL", url, "-o", str(installer)],
-        ["cmd", "/c", "start", "/wait", "", str(installer),
-         "/InstallationType=JustMe", "/RegisterPython=0", "/AddToPath=0", "/S", f"/D={prefix}"],
-        [str(prefix / "Scripts" / "conda.exe"), "init", "cmd.exe", "powershell", "bash"],
-    ]
-    assert next(s for s in plan.steps if s.id == "conda-env").action == "CREATE"
+    text = render_plan(plan)
+    # The human render carries the rectification commands but NO digest / apply command.
+    assert "Miniconda3-latest-Linux-x86_64.sh" in text
+    assert "Plan digest:" not in text and "--apply" not in text
 
-
-def test_conda_bootstrap_apply_runs_commands_in_order(tmp_path, monkeypatch):
-    """Apply issues the exact download→install→init argv in order, each with its own timeout."""
-    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))  # in-process PATH prepend auto-restored
-    run = RecordingRun()
-    engine, ctx = make_engine(
-        tmp_path, conda=FakeConda(available=False),
-        platform="linux", machine="x86_64", home=tmp_path, run=run,
-    )
-    plan = engine.build_plan()
-    report = engine.apply(plan.digest)
-    assert report.exit_code == 0, render_report(report)
-
-    prefix = tmp_path / "miniconda3"
-    installer = tmp_path / ".chinamaxM-miniconda.sh"
-    url = "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
-    assert [c["argv"] for c in run.calls[:3]] == [
-        ["curl", "-fsSL", url, "-o", str(installer)],
-        ["bash", str(installer), "-b", "-u", "-p", str(prefix)],
-        [str(prefix / "bin" / "conda"), "init", "bash"],
-    ]
-    assert [c["timeout"] for c in run.calls[:3]] == [
-        _MINICONDA_DL_TIMEOUT, _MINICONDA_INSTALL_TIMEOUT, _CONDA_INIT_TIMEOUT,
-    ]
-    # After the fresh install the env-create step runs next (FakeConda records the create).
-    assert ctx["conda"].created == 1 and ctx["conda"].pip_calls
-    assert {r.id: r.status for r in report.step_results}["conda-bootstrap"] == "ok"
-
-
-def test_conda_bootstrap_apply_stops_on_first_failure(tmp_path, monkeypatch):
-    """A non-zero installer return fails the bootstrap step and aborts the rest; init never runs."""
-    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
-    run = RecordingRun(fail_on=lambda argv: argv[:1] == ["bash"])  # the installer command fails
-    engine, ctx = make_engine(
-        tmp_path, conda=FakeConda(available=False),
-        platform="linux", machine="x86_64", home=tmp_path, run=run,
-    )
-    plan = engine.build_plan()
-    report = engine.apply(plan.digest)
-
-    outcomes = {r.id: r.status for r in report.step_results}
-    assert outcomes["conda-bootstrap"] == "failed"
-    assert outcomes["conda-env"] == "aborted" and outcomes["env-flip"] == "aborted"
-    assert ctx["conda"].created == 0  # never reached the env-create step
-    # Only curl + the failing installer ran; conda init was never issued.
-    assert [c["argv"][0] for c in run.calls] == ["curl", "bash"]
-    assert not (tmp_path / "claude" / "settings.json").exists()
-    assert report.exit_code == 1
-
-
-def test_conda_bootstrap_unsupported_arch_gates(tmp_path):
-    """POSIX arch off the map ⇒ advice-only gate, no BOOTSTRAP step, no leaked installer URL."""
-    engine, ctx = make_engine(
-        tmp_path, conda=FakeConda(available=False),
-        platform="linux", machine="ppc64le", home=tmp_path,
-    )
-    plan = engine.build_plan()
-    assert not any(s.action == "BOOTSTRAP" for s in plan.steps)
-    gate = _bootstrap_step(plan)
-    assert gate.gate_fail and gate.action == "GATE-FAIL"
-    assert "unsupported CPU architecture" in gate.gate_detail and "ppc64le" in gate.gate_detail
-    assert "Miniconda3-latest" not in gate.gate_detail
-    assert "Miniconda3-latest" not in render_plan(plan)
-
-    report = engine.apply(plan.digest)
-    assert {r.id: r.status for r in report.step_results}["conda-bootstrap"] == "failed"
-    assert ctx["conda"].created == 0 and report.exit_code == 1
-
-
-def test_conda_bootstrap_skipped_when_conda_available(tmp_path):
-    """conda already present ⇒ no bootstrap step; the normal create step is planned instead."""
-    engine, _ctx = make_engine(tmp_path)  # default FakeConda(available=True, exists=False)
-    plan = engine.build_plan()
-    assert not any(s.id == "conda-bootstrap" for s in plan.steps)
-    assert not any(s.action == "BOOTSTRAP" for s in plan.steps)
-    assert any(s.id == "conda-env" and s.action == "CREATE" for s in plan.steps)
-
-
-def test_conda_bootstrap_digest_binds_machine(tmp_path):
-    """The plan digest changes when the machine changes the bootstrap URL (nothing else varies)."""
-    home = tmp_path / "home"
-    e1, _ = make_engine(tmp_path, conda=FakeConda(available=False), platform="linux", machine="x86_64", home=home)
-    e2, _ = make_engine(tmp_path, conda=FakeConda(available=False), platform="linux", machine="aarch64", home=home)
-    assert e1.build_plan().digest != e2.build_plan().digest
+    # Diagnostic-only: no mutating op ran on the paused plan.
+    assert not any(kind == "mutating" for kind, _ in engine._runner.record)
 
 
 def test_conda_bin_precedence_and_which_fallback(tmp_path, monkeypatch):
@@ -940,3 +1046,41 @@ def test_conda_bin_precedence_and_which_fallback(tmp_path, monkeypatch):
     bare_rec = RecordingRun()
     _SubprocessConda(bare_rec, home=empty_home, platform="linux").create()
     assert bare_rec.calls[-1]["argv"][0] == "conda"  # nothing resolvable ⇒ bare "conda"
+
+
+# ------------------------------------------- setup surface: prerequisite-protocol invariants
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SETUP_COMMAND = _REPO_ROOT / "commands" / "setup.md"
+_SETUP_SKILL = _REPO_ROOT / "skills" / "chinamaxM-setup" / "SKILL.md"
+
+#: The Windows zero-state Git bootstrap line — must appear EXACTLY once (only in the block).
+_ZERO_STATE_GIT_LINE = "winget install --id Git.Git"
+
+
+@pytest.mark.parametrize("surface", [_SETUP_COMMAND, _SETUP_SKILL])
+def test_setup_surface_prerequisite_protocol(surface):
+    """Both setup surfaces carry the row-execution protocol + the Windows zero-state block."""
+    text = surface.read_text(encoding="utf-8")
+    lower = text.lower()
+
+    # The exact consent word and the stop-on-first-failure rule.
+    assert 'reply "approve" to install these' in lower
+    assert "stop-on-first-failure" in lower
+
+    # Every run_policy and every shell dispatch target is documented.
+    for token in ("run_policy", "agent", "privileged", "operator", "cmd /c"):
+        assert token in text, token
+    assert "sudo -n true" in text
+    assert "never" in lower and "git bash" in lower  # powershell/native/cmd rows never in Git Bash
+    assert "conda init" in text  # the miniconda-row shell-startup-edit warning
+
+    # The launcher is the ambient-Python plan-only entry, and the digest gates apply.
+    assert "python3 -m chinamaxM.setup --plan-only" in text
+    assert "--apply --plan-digest" in text
+
+    # The Windows zero-state block appears EXACTLY once, with all four bootstrap lines.
+    assert lower.count(_ZERO_STATE_GIT_LINE.lower()) == 1
+    assert "Miniconda3-latest-Windows-x86_64.exe" in text
+    assert r"conda.exe" in text and "init cmd.exe powershell bash" in text

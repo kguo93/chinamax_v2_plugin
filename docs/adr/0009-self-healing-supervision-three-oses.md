@@ -80,3 +80,43 @@ falls back to an advice-only gate (no URL); Windows never gate-fails on arch (al
 asset). Like the WinSW path, the Windows bootstrap is mocked-tested only — NOT live-verified on
 a real Windows host in this build (`start /wait` may not propagate the installer's exit code to
 `%ERRORLEVEL%`).
+
+**Amended 2026-08-14 (setup DETECTS prerequisites and EMITS agent-run Rectification rows;
+reverses the engine-self-install stance immediately above).** The amendment just above —
+"`/setup` now INSTALLS Miniconda when `conda` is absent instead of gate-failing … The bootstrap
+runs as a normal digest-bound, consent-gated apply step (its URL + argv commands ride the
+descriptor …), and it resolves conda by absolute path so the same apply pass can create the env
+and pip-install into it." — is **reversed**. That model was architecturally wrong: the setup
+ENGINE runs under an ambient Python, so having the engine itself download and run the Miniconda
+installer does NOT work on a bare Windows/macOS box with no Python, and it never installed Git
+Bash (which the Codex hooks need on Windows). The corrected model — copied faithfully from the
+original plugin's `doctor` (a separate checkout; no cross-repo code import) — is: setup's Python
+only **DETECTS** the Platform Prerequisites (`bash` on Linux/macOS; `git`/`bash`/`cygpath` from
+Git for Windows on Windows; Miniconda on all three) and **EMITS** per-tool agent-run
+**Rectification rows** (`{name, summary, commands, run_policy, shell, install_location}`, plus
+`missing_tools` on the Git row). When any Prerequisite is missing, `--plan-only` PAUSES (Phase A):
+it surfaces the `prerequisite_fixes` rows and emits NO mutating plan and NO plan digest. The HOST
+agent — via the `/chinamaxM:setup` command / `chinamaxM-setup` skill protocol — runs those rows
+IN ORDER after the operator types "approve" (dispatched by `run_policy`: `agent` = run;
+`privileged` = `sudo -n true` gate then run, else hand to the operator; `operator` = advice-only),
+each through the row's `shell` (`cmd` via `cmd /c`; `powershell`/`native` natively — never Git
+Bash; `bash` via bash), stop-on-first-failure; then the launcher is re-run once, and only with
+every Prerequisite present is the normal mutating plan emitted. The **engine NEVER downloads or
+runs an installer.** Consequences: **no ambient-Python dependency** — a bare Windows box uses the
+zero-state cmd.exe fallback (`winget install --id Git.Git …`, `curl.exe … Miniconda3-latest-
+Windows-x86_64.exe`, `start /wait … /InstallationType=JustMe /S /D=%USERPROFILE%\miniconda3`,
+`conda.exe init cmd.exe powershell bash`) when the launcher itself cannot start. **Git for Windows
+is now bootstrapped** (its bash/cygpath are what the Codex `commandWindows` hook shims need). The
+Windows `bash`/`cygpath` prerequisite is detected in the standard Git-for-Windows install roots
+ONLY — never PATH — because Git for Windows leaves them off PATH by default, so a bash that IS on
+PATH is almost certainly WSL's `System32\bash.exe`, not Git Bash; the `codex_hook_bash.cmd` shim
+resolves Git Bash the SAME tree-only way (no `where bash` PATH fallback), so the bash the doctor
+green-lights is exactly the one the hooks run.
+Miniconda is still `Miniconda3-latest-*` with **NO version pin and NO checksum** (the old plugin's
+accepted tradeoff, inherited verbatim); an unsupported CPU architecture yields an advice-only
+miniconda row (no URL). The Windows rows remain **mocked-only** — NOT live-verified on a real
+Windows host in this build. In the same spirit of Host parity, the warn-only SessionStart check is
+now **host-aware**: the Codex Host has no `settings.json` flip, so its SessionStart warns iff a
+generated `model_providers.chinamaxM-<profile>` entry is present in `~/.codex/config.toml` AND the
+Registry Proxy port is dead, pointing the operator at the `chinamaxM-doctor` skill (the Claude
+`ANTHROPIC_BASE_URL`-flip path is unchanged). Both remain strictly fail-open.

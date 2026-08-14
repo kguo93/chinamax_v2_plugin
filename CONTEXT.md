@@ -83,3 +83,11 @@ The pure-diagnosis command: free, local, token-less, mutation-less. Probes only 
 
 **Setup**:
 The consent-gated mutating command: diagnose → plan → approve → apply → re-diagnose → report. The only place live paid probes run, opt-in at the consent pause.
+
+**Prerequisite**:
+An external Platform tool setup must have before it can build the `chinamaxM` conda env the Proxy runs in — `bash`, Git for Windows' `git`/`bash`/`cygpath` (Windows), Miniconda's `conda` — detected per Platform at the start of setup, before any conda-env / dependency / Key-file / service mutation (the plan's read-only diagnose still runs). Distinct from the Python dependencies installed inside the env. A missing Prerequisite PAUSES setup (Phase A) for operator approval; it is never installed silently, and the setup engine never runs an installer itself. On Windows a Prerequisite means Git for Windows' own tooling specifically — Git Bash is resolved from the Git-for-Windows install tree, never a PATH bash (which may be WSL's, not the bash the Codex hooks run).
+_Avoid_: dependency (reserved for the Python packages in the env), requirement
+
+**Rectification row**:
+The plain dict setup EMITS for one missing Prerequisite on the current Platform — `{name, summary, commands, run_policy, shell, install_location}` (plus `missing_tools` on the Git for Windows row) — the single source of truth for how that Prerequisite gets installed. The Host agent runs a row's `commands` verbatim, dispatched by its `run_policy` (`agent` / `privileged` / `operator`) through its `shell` (`cmd` / `powershell` / `native` / `bash`), only after the operator approves; the setup engine never runs them. The `--plan-only` Phase-A pause carries these rows under the `prerequisite_fixes` key.
+_Avoid_: calling a row a "fix" in prose (the serialized key stays `prerequisite_fixes`, but the concept is a Rectification row), installer script

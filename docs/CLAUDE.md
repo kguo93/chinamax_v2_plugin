@@ -34,11 +34,11 @@ exists is the product code + active manifests; until then it is these ADRs.
 | Dialect policy: Anthropic-native rule, LiteLLM as sole translator, Responses-only OpenAI dialect, tool-type stripping at the Seam, same-type-run grouping, prefix-cache stability guard | **0002** |
 | Registry: profiles.json v2 schema (default_model scalar; no models[]/match), the six shipped Profiles + full seed pin, overlay merge, thinking normalization, scrub, extras guard | **0003** |
 | Workers as native subagents: ONE generated Claude agent .md / Codex role TOML per Profile, dispatch-mutable model line, reserved names, regeneration/drift | **0004** |
-| Host command surfaces: /task /setup /doctor /profiles, SessionStart hook, doctor roster + warn/fail semantics, setup consent flow + live probes | **0005** |
+| Host command surfaces: /task /setup /doctor /profiles, host-aware SessionStart hook (Claude + Codex), doctor roster + warn/fail semantics, setup consent flow incl. the Phase-A Platform-Prerequisite pause / Rectification-row protocol (bootstrap mechanics live in **0009**) + live probes | **0005** |
 | API keys: per-host model-keys.env files, proxy-side injection, scaffolding | **0006** |
 | Result relay + steering: worker contract hooks, verbatim no-attribution relay, Codex parent-mediated steer | **0007** |
 | Worker resume: live-session continuity, out-of-scope dead-session recovery, Codex thread re-attach | **0008** |
-| Proxy supervision on Linux/macOS/Windows: systemd/launchd/WinSW, self-healing, conda env bootstrap (Miniconda auto-install) | **0009** |
+| Proxy supervision on Linux/macOS/Windows: systemd/launchd/WinSW, self-healing, Platform-Prerequisite detection + agent-run Rectification rows (bash / Git for Windows / Miniconda; engine never installs), warn-only host-aware SessionStart (Claude `ANTHROPIC_BASE_URL` flip + Codex `config.toml` provider) | **0009** |
 | Observability: JSONL request log, usage/cache accounting, count_tokens fallback | **0010** |
 | Tests: hermetic fake providers, real-litellm-in-loop, prefix-stability byte tests | **0011** |
 | Distribution: GitHub canonical source, dual-manifest sync, versioning, rpi4 git-only backup | **0012** |

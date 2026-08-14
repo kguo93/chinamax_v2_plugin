@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,8 @@ from chinamaxM.hooks.worker_contract import RELAY_RULE, WORKER_CONTRACT
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CODEX_HOOKS_JSON = REPO_ROOT / "hooks" / "codex-hooks.json"
+CLAUDE_HOOKS_JSON = REPO_ROOT / "hooks" / "hooks.json"
+SESSION_START_SHIM = REPO_ROOT / "scripts" / "session_start_hook"
 SKILL_FILE = REPO_ROOT / "skills" / "chinamaxM-task" / "SKILL.md"
 CLAUDE_COMMAND_FILE = REPO_ROOT / "commands" / "task.md"
 CODEX_WINDOWS_WRAPPER = REPO_ROOT / "scripts" / "codex_hook_bash.cmd"
@@ -369,3 +372,157 @@ def test_codex_manifest_registered():
                 cw = hook["commandWindows"]
                 assert "codex_hook_bash.cmd" in cw
                 assert CODEX_WINDOWS_WRAPPER.exists(), CODEX_WINDOWS_WRAPPER
+
+
+# ---------------------------------------------------- test 7 (Codex SessionStart registration)
+
+
+def test_codex_sessionstart_registered():
+    """Codex now registers a warn-only SessionStart with the Git-Bash commandWindows shim."""
+    hooks = json.loads(CODEX_HOOKS_JSON.read_text(encoding="utf-8"))
+    groups = hooks["hooks"]["SessionStart"]
+    assert len(groups) == 1 and len(groups[0]["hooks"]) == 1
+    group = groups[0]
+    hook = group["hooks"][0]
+
+    # The pinned event matcher, timeout, and the POSIX shim (exists + executable).
+    assert group["matcher"] == "startup|resume|clear|compact|fork"
+    assert hook["type"] == "command" and hook["timeout"] == 10
+    posix = hook["command"].replace("${PLUGIN_ROOT}", str(REPO_ROOT)).strip().strip('"')
+    assert Path(posix) == SESSION_START_SHIM
+    assert SESSION_START_SHIM.exists() and os.access(SESSION_START_SHIM, os.X_OK)
+
+    # commandWindows enters Git Bash via the shared .cmd wrapper, execing the same shim basename.
+    cw = hook["commandWindows"]
+    assert "codex_hook_bash.cmd" in cw and "session_start_hook" in cw
+    assert CODEX_WINDOWS_WRAPPER.exists(), CODEX_WINDOWS_WRAPPER
+
+
+def test_codex_hook_bash_cmd_resolves_git_tree_only():
+    """The Git-Bash shim resolves from the Git for Windows install roots only — no PATH fallback.
+
+    Consistency guard: the doctor's Windows `bash` prerequisite is detected tree-only (a PATH
+    bash is WSL's, not Git Bash), and this shim — the bash "actually being used" by the hooks —
+    must resolve the SAME way, so the doctor never green-lights a bash the shim cannot run.
+    """
+    text = CODEX_WINDOWS_WRAPPER.read_text(encoding="utf-8")
+    # Resolves Git Bash from the standard Git for Windows roots (system-wide + per-user), via
+    # the intermediate %R% root variable (`set "R=%ProgramFiles%"` → `%R%\Git\bin\bash.exe`).
+    assert 'set "R=%ProgramFiles%"' in text
+    assert 'set "R=%LOCALAPPDATA%"' in text
+    assert r"%R%\Git\bin\bash.exe" in text
+    assert r"%R%\Programs\Git\bin\bash.exe" in text
+    # No PATH fallback: no ACTIVE (non-`rem`-comment) line invokes `where bash` (a PATH bash
+    # cannot be assumed Git Bash). The explanatory comment may still name it.
+    active_lines = [ln for ln in text.splitlines() if not ln.strip().startswith("rem")]
+    assert not any("where bash" in ln for ln in active_lines)
+    # A missing Git Bash is a hard error, never a silent PATH pick.
+    assert "exit /b 127" in text
+
+
+def test_sessionstart_symmetry_claude_codex():
+    """Claude and Codex register SessionStart with the SAME matcher and the SAME POSIX shim."""
+    claude = json.loads(CLAUDE_HOOKS_JSON.read_text(encoding="utf-8"))["hooks"]["SessionStart"][0]
+    codex = json.loads(CODEX_HOOKS_JSON.read_text(encoding="utf-8"))["hooks"]["SessionStart"][0]
+
+    assert claude["matcher"] == codex["matcher"] == "startup|resume|clear|compact|fork"
+
+    def _shim(entry, var):
+        return entry["hooks"][0]["command"].replace(var, str(REPO_ROOT)).strip().strip('"')
+
+    # Both resolve to the identical scripts/session_start_hook (one host-aware module).
+    assert _shim(claude, "${CLAUDE_PLUGIN_ROOT}") == _shim(codex, "${PLUGIN_ROOT}") == str(SESSION_START_SHIM)
+    # Only Codex carries the Git-Bash commandWindows shim (Claude runs the POSIX shim directly).
+    assert "commandWindows" in codex["hooks"][0]
+    assert "commandWindows" not in claude["hooks"][0]
+
+
+# ------------------------------------------------ test 8 (Codex SessionStart LIVE, host-aware)
+
+
+def _codex_overlay(claude_home: Path, port: int) -> None:
+    """Pin the Registry port via a CHINAMAXM_CLAUDE_HOME overlay (deterministic port)."""
+    (claude_home / "chinamaxM").mkdir(parents=True, exist_ok=True)
+    (claude_home / "chinamaxM" / "profiles.json").write_text(
+        json.dumps({"port": port}), encoding="utf-8"
+    )
+
+
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _run_codex_session_start(codex_root: Path, claude_home: Path) -> subprocess.CompletedProcess:
+    """Run the registered Codex SessionStart command with a Codex-shaped environment."""
+    hooks = json.loads(CODEX_HOOKS_JSON.read_text(encoding="utf-8"))
+    command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"].replace(
+        "${PLUGIN_ROOT}", str(REPO_ROOT)
+    )
+    env = os.environ.copy()
+    # Codex environment: PLUGIN_ROOT (not CLAUDE_PLUGIN_ROOT) so the module resolves the Codex Host.
+    for key in ("CLAUDE_PLUGIN_ROOT", "CLAUDE_CONFIG_DIR"):
+        env.pop(key, None)
+    env["PLUGIN_ROOT"] = str(REPO_ROOT)
+    env["CHINAMAXM_PYTHON"] = sys.executable
+    env["CHINAMAXM_CODEX_HOME"] = str(codex_root)
+    env["CHINAMAXM_CLAUDE_HOME"] = str(claude_home)  # pins the Registry overlay (Proxy port)
+    return subprocess.run(
+        command,
+        shell=True,
+        input='{"hook_event_name":"SessionStart"}',
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+
+def test_codex_sessionstart_live(tmp_path):
+    """AC (LIVE): warn iff chinamaxM is Codex-configured AND the Proxy port is dead; else silent."""
+    provider_entry = (
+        '[model_providers.chinamaxM-deepseek]\n'
+        'name = "chinamaxM-deepseek"\n'
+        'base_url = "http://127.0.0.1:9/openai/deepseek"\n'
+        'wire_api = "responses"\n'
+    )
+
+    # Configured for Codex + a dead Proxy port ⇒ warn, pointing at the chinamaxM-doctor SKILL.
+    configured = tmp_path / "codex-configured"
+    configured.mkdir()
+    (configured / "config.toml").write_text(provider_entry, encoding="utf-8")
+    dead_home = tmp_path / "home-dead"
+    _codex_overlay(dead_home, _free_port())  # nothing listening ⇒ dead
+    result = _run_codex_session_start(configured, dead_home)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert "chinamaxM-doctor" in payload["systemMessage"]
+    assert "/chinamaxM:doctor" not in payload["systemMessage"]  # the Codex skill, not the command
+
+    # NOT configured for Codex (no chinamaxM- provider entry) ⇒ silent, even with a dead port.
+    unconfigured = tmp_path / "codex-plain"
+    unconfigured.mkdir()
+    (unconfigured / "config.toml").write_text('[model_providers.openai]\nname = "openai"\n', encoding="utf-8")
+    result = _run_codex_session_start(unconfigured, tmp_path / "home-plain")
+    assert result.returncode == 0 and result.stdout.strip() == "", result.stdout
+
+    # No config.toml at all ⇒ silent (chinamaxM is not wired into Codex).
+    empty = tmp_path / "codex-empty"
+    empty.mkdir()
+    result = _run_codex_session_start(empty, tmp_path / "home-empty")
+    assert result.returncode == 0 and result.stdout.strip() == "", result.stdout
+
+    # Configured + a LIVE Proxy port ⇒ silent.
+    live_home = tmp_path / "home-live"
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    _codex_overlay(live_home, listener.getsockname()[1])
+    try:
+        result = _run_codex_session_start(configured, live_home)
+    finally:
+        listener.close()
+    assert result.returncode == 0 and result.stdout.strip() == "", result.stdout

@@ -69,3 +69,31 @@ roster updates).**
   other mutation) so the ops PRD's "survives reboots" claim is literally true headless;
   macOS LaunchAgents remain login-scoped (per-OS scope stated honestly in ops docs).
 - `/profiles` lists resolved Profiles with their `default_model` (no model lists exist).
+
+**Amended 2026-08-14 (setup gains a Phase-A Platform-Prerequisite pause; SessionStart hook is
+host-aware with a Codex twin — cross-ref ADR 0009 as amended 2026-08-14).**
+
+- **`/setup` gains a Phase-A Platform-Prerequisite pause.** The original setup bullet read
+  "Applies: **miniconda gate**; conda env `chinamaxM` + aiohttp + pinned litellm; …". That single
+  miniconda gate is superseded by a per-Platform Prerequisite pause that runs BEFORE the mutating
+  plan: setup DETECTS the Platform Prerequisites (`bash`; Git for Windows' `git`/`bash`/`cygpath`
+  on Windows; Miniconda's `conda`) and, when any is missing, `--plan-only` PAUSES — surfacing
+  agent-run **Rectification rows** (serialized under `prerequisite_fixes`) and emitting NO
+  mutating plan and NO plan digest. The Host agent runs those rows on "approve" (dispatched by
+  each row's `run_policy`, through its `shell`, stop-on-first-failure), then re-runs the launcher
+  once; only with every Prerequisite present does the normal consent-gated plan
+  (env/deps/generate/service/flip + opt-in probes) appear. The setup engine NEVER downloads or
+  runs an installer — the bootstrap mechanics (per-OS commands, the Windows zero-state cmd.exe
+  fallback, Git for Windows so the Codex hooks have Git Bash, no-pin/no-checksum Miniconda,
+  unsupported-arch advice) live in **ADR 0009 (as amended 2026-08-14)**, which this
+  cross-references and whose "miniconda gate" wording it supersedes.
+- **SessionStart hook is now host-aware, with a Codex twin.** The original bullet described a
+  single Claude path ("if the env flip is present but the proxy port is dead, emit a
+  systemMessage pointing at `/chinamaxM:doctor`"). That Claude path is unchanged, but the hook now
+  resolves the Host from its environment and adds a **Codex twin**: Codex has no `settings.json`
+  flip, so its SessionStart warns iff chinamaxM is wired into Codex (a generated
+  `model_providers.chinamaxM-<profile>` entry in `~/.codex/config.toml`) AND the Registry Proxy
+  port is dead, pointing the operator at the `chinamaxM-doctor` skill. Both remain strictly
+  warn-only and fail-open; supervision is still the OS's job (ADR 0009). Registered symmetrically
+  in `hooks/hooks.json` and `hooks/codex-hooks.json` (the latter with the Git-Bash
+  `commandWindows` shim).

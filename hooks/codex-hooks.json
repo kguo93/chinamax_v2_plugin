@@ -1,6 +1,19 @@
 {
-  "description": "chinamaxM Codex worker-contract hooks (ADR 0005/0007). SubagentStart injects the numbered Worker contract (complete-final-report duty) into a spawned chinamaxM Worker role; PreToolUse(spawn_agent) injects the verbatim no-attribution Relay rule into the dispatching parent. The adapter shim translates the Codex payload (tool_name spawn_agent -> Agent; tool_input.agent_type -> subagent_type) and reuses the shared worker_contract module, whose matching is anchored and Registry-derived in Python — SubagentStart carries NO static matcher because Overlay Profiles are dynamic, so the script does the anchored match. PreToolUse matches spawn_agent ONLY (never Bash) to avoid taxing every shell call. Both fail open (exit 0, no injection) on any internal fault. commandWindows enters Git Bash so the POSIX shim runs unchanged.",
+  "description": "chinamaxM Codex worker-contract + SessionStart hooks (ADR 0005/0007/0009). SubagentStart injects the numbered Worker contract (complete-final-report duty) into a spawned chinamaxM Worker role; PreToolUse(spawn_agent) injects the verbatim no-attribution Relay rule into the dispatching parent; SessionStart runs the host-aware warn-only proxy-port check (Codex path: warn iff chinamaxM is wired into ~/.codex/config.toml and the Registry Proxy port is dead, pointing at the chinamaxM-doctor skill). The adapter shim translates the Codex payload (tool_name spawn_agent -> Agent; tool_input.agent_type -> subagent_type) and reuses the shared worker_contract module, whose matching is anchored and Registry-derived in Python — SubagentStart carries NO static matcher because Overlay Profiles are dynamic, so the script does the anchored match. PreToolUse matches spawn_agent ONLY (never Bash) to avoid taxing every shell call. All fail open (exit 0, no injection) on any internal fault. commandWindows enters Git Bash so the POSIX shim runs unchanged.",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/scripts/session_start_hook\"",
+            "commandWindows": "cmd /d /c \"\"%PLUGIN_ROOT%\\scripts\\codex_hook_bash.cmd\" session_start_hook\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "SubagentStart": [
       {
         "hooks": [
