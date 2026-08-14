@@ -27,7 +27,7 @@ authority.
 - `model=<any string>` GIVEN ⇒ rewrite the Generated agent's model line in place FIRST,
   by running this via Bash, then spawn:
 
-  `python -m chinamaxM.set_model claude <profile> <model>`
+  `"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" set_model claude <profile> <model>`
 
   This makes the agent frontmatter `model: <profile>/<model>` (the Profile prefix routes
   on the Anthropic ingress). The rewrite→spawn window is per-dispatch and accepted;

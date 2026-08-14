@@ -874,7 +874,7 @@ def test_prerequisite_fixes_linux_bash_and_miniconda(tmp_path, monkeypatch, mach
     assert bash_row["commands"] == ["sudo apt-get install -y bash"]
     url = f"https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-{machine}.sh"
     assert mini["commands"] == [
-        f'curl -fsSL {url} -o "$HOME/.chinamaxM-miniconda.sh"',
+        f'if command -v curl >/dev/null 2>&1; then curl -fsSL {url} -o "$HOME/.chinamaxM-miniconda.sh"; else wget -qO "$HOME/.chinamaxM-miniconda.sh" {url}; fi',
         'bash "$HOME/.chinamaxM-miniconda.sh" -b -u -p "$HOME/miniconda3"',
         '"$HOME/miniconda3/bin/conda" init bash',
     ]
@@ -904,6 +904,9 @@ def test_prerequisite_fixes_darwin(tmp_path, monkeypatch):
     assert bash_row["commands"] == ["brew install bash"] and bash_row["run_policy"] == "agent"
     assert bash_row["install_location"] == "Homebrew"
     assert "Miniconda3-latest-MacOSX-arm64.sh" in mini["commands"][0]
+    # The download step is the curl-or-wget one-liner (minimal-image hosts without curl).
+    assert mini["commands"][0].startswith("if command -v curl >/dev/null 2>&1;")
+    assert "wget -qO" in mini["commands"][0]
     assert mini["commands"][2] == '"$HOME/miniconda3/bin/conda" init bash zsh'
     assert len(mini["commands"]) == 3
 
@@ -1076,11 +1079,194 @@ def test_setup_surface_prerequisite_protocol(surface):
     assert "never" in lower and "git bash" in lower  # powershell/native/cmd rows never in Git Bash
     assert "conda init" in text  # the miniconda-row shell-startup-edit warning
 
-    # The launcher is the ambient-Python plan-only entry, and the digest gates apply.
-    assert "python3 -m chinamaxM.setup --plan-only" in text
+    # The launcher is the shim plan-only entry, and the digest gates apply.
+    assert '/scripts/chinamaxM" setup --plan-only' in text
     assert "--apply --plan-digest" in text
 
     # The Windows zero-state block appears EXACTLY once, with all four bootstrap lines.
     assert lower.count(_ZERO_STATE_GIT_LINE.lower()) == 1
     assert "Miniconda3-latest-Windows-x86_64.exe" in text
     assert r"conda.exe" in text and "init cmd.exe powershell bash" in text
+
+    # The macOS operator kick-back section is present in both surfaces (no agent-run
+    # macOS bootstrap — the launcher refuses the CLT stub and hands back to the operator).
+    assert "no usable Python 3" in text
+    assert "xcode-select --install" in text
+
+
+# ---------------------------------------------- launcher shim (subprocess behavior)
+
+_LAUNCHER = _REPO_ROOT / "scripts" / "chinamaxM"
+
+#: A minimal PATH with coreutils + bash but NO conda, so the launcher's `conda run` rung is
+#: never satisfied by the developer's real ~/miniconda3 during these hermetic tests.
+_MIN_PATH = "/usr/bin:/bin"
+
+
+def _fake_exe(path: Path, body: str) -> Path:
+    """Write an executable /bin/sh script that runs ``echo "<body>"`` and exits 0."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'#!/bin/sh\necho "{body}"\n', encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _run_launcher(env: dict, *, args=("setup", "--plan-only"), path=_MIN_PATH):
+    """Run ``bash scripts/chinamaxM <args>`` under a fully-controlled environment."""
+    full_env = {"PATH": path}
+    full_env.update(env)
+    return subprocess.run(
+        ["bash", str(_LAUNCHER), *args],
+        capture_output=True,
+        text=True,
+        env=full_env,
+        timeout=60,
+    )
+
+
+def test_launcher_shim_rung_precedence(tmp_path):
+    """The launcher resolves the interpreter by the pinned rung order (recorded first)."""
+    home = tmp_path / "home"
+    fake_a = _fake_exe(tmp_path / "a" / "python", "MARK_A")
+    fake_b = _fake_exe(tmp_path / "b" / "python", "MARK_B")
+    _fake_exe(home / "miniconda3" / "envs" / "chinamaxM" / "bin" / "python", "MARK_C")
+
+    def _claude_root(name: str, recorded: str | None) -> Path:
+        root = tmp_path / name
+        (root / "chinamaxM").mkdir(parents=True)
+        if recorded is not None:
+            (root / "chinamaxM" / "python-path").write_text(recorded + "\n", encoding="utf-8")
+        return root
+
+    # (a) the recorded python-path beats $CHINAMAXM_PYTHON.
+    root_a = _claude_root("claude_a", str(fake_a))
+    r = _run_launcher(
+        {"HOME": str(home), "CHINAMAXM_CLAUDE_HOME": str(root_a), "CHINAMAXM_PYTHON": str(fake_b)}
+    )
+    assert "MARK_A" in r.stdout, r.stderr
+
+    # (b) with no recorded file, $CHINAMAXM_PYTHON wins.
+    root_b = _claude_root("claude_b", None)
+    r = _run_launcher(
+        {"HOME": str(home), "CHINAMAXM_CLAUDE_HOME": str(root_b), "CHINAMAXM_PYTHON": str(fake_b)}
+    )
+    assert "MARK_B" in r.stdout, r.stderr
+
+    # (c) with neither, ~/miniconda3/envs/chinamaxM/bin/python wins.
+    root_c = _claude_root("claude_c", None)
+    r = _run_launcher({"HOME": str(home), "CHINAMAXM_CLAUDE_HOME": str(root_c)})
+    assert "MARK_C" in r.stdout, r.stderr
+
+    # (d) none of those, but a base ~/miniconda3/bin/python present ⇒ the base bootstrap rung
+    #     fires WITH src/ on PYTHONPATH.
+    home_d = tmp_path / "home_d"
+    _fake_exe(home_d / "miniconda3" / "bin" / "python", "D_RAN PYTHONPATH=$PYTHONPATH")
+    root_d = _claude_root("claude_d", None)
+    r = _run_launcher({"HOME": str(home_d), "CHINAMAXM_CLAUDE_HOME": str(root_d)})
+    assert "D_RAN" in r.stdout, r.stderr
+    assert str(_REPO_ROOT / "src") in r.stdout
+
+    # (e) a stale (non-executable) recorded path falls through to the next rung.
+    stale = tmp_path / "stale-python"
+    stale.write_text("#!/bin/sh\necho STALE\n", encoding="utf-8")  # left non-executable
+    root_e = _claude_root("claude_e", str(stale))
+    home_e = tmp_path / "home_e"
+    r = _run_launcher(
+        {"HOME": str(home_e), "CHINAMAXM_CLAUDE_HOME": str(root_e), "CHINAMAXM_PYTHON": str(fake_b)}
+    )
+    assert "MARK_B" in r.stdout and "STALE" not in r.stdout, r.stderr
+
+
+def test_launcher_macos_stub_guard(tmp_path):
+    """On macOS the ambient rung refuses the Xcode CLT stub unless the CLT is present."""
+    home = tmp_path / "mac_home"
+    home.mkdir()
+    root = tmp_path / "claude"
+    (root / "chinamaxM").mkdir(parents=True)
+    base_env = {"HOME": str(home), "CHINAMAXM_CLAUDE_HOME": str(root)}
+
+    # (1) python3 == /usr/bin/python3 and NO xcode-select on PATH ⇒ refuse (exit 1).
+    darwin_bin = tmp_path / "darwinbin"
+    _fake_exe(darwin_bin / "uname", "Darwin")
+    r = _run_launcher(base_env, path=f"{darwin_bin}:/usr/bin:/bin")
+    assert r.returncode == 1
+    assert "no usable Python 3" in r.stderr
+    assert "xcode-select --install" in r.stderr
+
+    # (2) with a fake xcode-select (CLT present) the stub is accepted; the refusal message is
+    #     ABSENT (the run may then fail for other reasons — assert only the guard behavior).
+    clt_bin = tmp_path / "cltbin"
+    _fake_exe(clt_bin / "uname", "Darwin")
+    _fake_exe(clt_bin / "xcode-select", "/Library/Developer/CommandLineTools")
+    r = _run_launcher(base_env, args=("set_model",), path=f"{clt_bin}:/usr/bin:/bin")
+    assert "no usable Python 3" not in r.stderr
+
+    # (3) python3 resolving anywhere OTHER than /usr/bin/python3 ⇒ accepted without any
+    #     xcode-select (a real interpreter, never the stub).
+    real_bin = tmp_path / "realbin"
+    _fake_exe(real_bin / "uname", "Darwin")
+    _fake_exe(real_bin / "python3", "MARK_REAL_PY3")
+    r = _run_launcher(base_env, path=f"{real_bin}:/usr/bin:/bin")
+    assert "no usable Python 3" not in r.stderr
+    assert "MARK_REAL_PY3" in r.stdout
+
+
+def test_launcher_windows_branch(tmp_path):
+    """OS=Windows_NT: env python.exe → base python.exe → ambient `python` (never python3)."""
+    root = tmp_path / "claude"
+    (root / "chinamaxM").mkdir(parents=True)
+
+    # (1) ~/miniconda3/envs/chinamaxM/python.exe is chosen.
+    up1 = tmp_path / "up1"
+    _fake_exe(up1 / "miniconda3" / "envs" / "chinamaxM" / "python.exe", "MARK_WIN_ENV")
+    r = _run_launcher(
+        {"HOME": str(up1), "USERPROFILE": str(up1), "CHINAMAXM_CLAUDE_HOME": str(root), "OS": "Windows_NT"}
+    )
+    assert "MARK_WIN_ENV" in r.stdout, r.stderr
+
+    # (2) only a base ~/miniconda3/python.exe ⇒ the base bootstrap rung fires.
+    up2 = tmp_path / "up2"
+    _fake_exe(up2 / "miniconda3" / "python.exe", "MARK_WIN_BASE")
+    r = _run_launcher(
+        {"HOME": str(up2), "USERPROFILE": str(up2), "CHINAMAXM_CLAUDE_HOME": str(root), "OS": "Windows_NT"}
+    )
+    assert "MARK_WIN_BASE" in r.stdout, r.stderr
+
+    # (3) no miniconda at all ⇒ the ambient fallback runs `python`, never `python3`.
+    up3 = tmp_path / "up3"
+    up3.mkdir()
+    ambient = tmp_path / "winbin"
+    _fake_exe(ambient / "python", "MARK_WIN_PYTHON")
+    _fake_exe(ambient / "python3", "MARK_WIN_PYTHON3_WRONG")
+    r = _run_launcher(
+        {"HOME": str(up3), "USERPROFILE": str(up3), "CHINAMAXM_CLAUDE_HOME": str(root), "OS": "Windows_NT"},
+        path=f"{ambient}:/usr/bin:/bin",
+    )
+    assert "MARK_WIN_PYTHON" in r.stdout, r.stderr
+    assert "MARK_WIN_PYTHON3_WRONG" not in r.stdout
+
+
+def test_launcher_unknown_subcommand():
+    """An unknown subcommand and a missing subcommand both exit 2 with the usage line."""
+    r = subprocess.run(
+        ["bash", str(_LAUNCHER), "bogus"], capture_output=True, text=True, timeout=30
+    )
+    assert r.returncode == 2
+    assert "usage: chinamaxM" in r.stderr
+
+    r = subprocess.run(["bash", str(_LAUNCHER)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 2
+    assert "usage: chinamaxM" in r.stderr
+
+
+def test_docs_never_hardcode_an_interpreter():
+    """No command/skill surface hardcodes an interpreter (regression guard for the bug family)."""
+    surfaces = sorted((_REPO_ROOT / "commands").glob("*.md")) + sorted(
+        (_REPO_ROOT / "skills").glob("*/SKILL.md")
+    )
+    assert surfaces, "no command/skill surfaces found — glob is wrong"
+    for path in surfaces:
+        text = path.read_text(encoding="utf-8")
+        assert "python3 -m" not in text, f"{path} still hardcodes `python3 -m`"
+        assert "conda run -n chinamaxM python" not in text, f"{path} still hardcodes a conda-run launcher"
+        assert "`python -m chinamaxM" not in text, f"{path} still has a backticked `python -m chinamaxM`"

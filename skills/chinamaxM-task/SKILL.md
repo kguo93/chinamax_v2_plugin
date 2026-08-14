@@ -38,7 +38,7 @@ authority.
 - `model=<any string>` GIVEN ⇒ rewrite the generated role's model line in place FIRST, by
   running this, then spawn:
 
-  `python -m chinamaxM.set_model codex <profile> <model>`
+  `"<plugin-checkout>/scripts/chinamaxM" set_model codex <profile> <model>`
 
   This makes the role TOML's `model` line the BARE string verbatim (the Profile rides the
   provider entry's ingress path, not the model string). The rewrite→spawn window is

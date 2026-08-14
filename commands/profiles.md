@@ -10,11 +10,11 @@ value.
 
 Run this via Bash and show the operator its complete output:
 
-`conda run -n chinamaxM python -m chinamaxM.doctor --profiles`
+`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" doctor --profiles`
 
 An unreadable Registry prints one error line and exits nonzero.
 
 ## Degraded-launch fallback
 
-If the command itself fails to launch — `conda` is missing, or the `chinamaxM` env does not
-exist — report that plainly and point the operator at `/chinamaxM:setup`.
+If the command itself fails to launch — no interpreter resolves (the `chinamaxM` env does not
+exist and no fallback rung matches) — report that plainly and point the operator at `/chinamaxM:setup`.

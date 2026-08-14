@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# The chinamaxM CLI launcher: map the subcommand to its module, then run it under the
+# interpreter _interpreter.sh resolves (discovery lives ONLY there). argv passes through
+# verbatim after the subcommand.
+set -euo pipefail
+CHINAMAXM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck source=scripts/_interpreter.sh
+. "${CHINAMAXM_SCRIPT_DIR}/_interpreter.sh"
+
+usage() {
+  echo "usage: chinamaxM {setup|doctor|set_model} [args...]" >&2
+  exit 2
+}
+
+[ "$#" -ge 1 ] || usage
+subcommand="$1"
+shift
+case "${subcommand}" in
+  setup) module=chinamaxM.setup ;;
+  doctor) module=chinamaxM.doctor ;;
+  set_model) module=chinamaxM.set_model ;;
+  *) usage ;;
+esac
+chinamaxm_exec "${module}" "$@"

@@ -120,3 +120,36 @@ now **host-aware**: the Codex Host has no `settings.json` flip, so its SessionSt
 generated `model_providers.chinamaxM-<profile>` entry is present in `~/.codex/config.toml` AND the
 Registry Proxy port is dead, pointing the operator at the `chinamaxM-doctor` skill (the Claude
 `ANTHROPIC_BASE_URL`-flip path is unchanged). Both remain strictly fail-open.
+
+**Amended 2026-08-14 (the launcher is a shim with pinned interpreter rungs; macOS zero-state is
+operator kick-back).** The amendment above concluded "**no ambient-Python dependency**", but that
+held only for the bare-Windows zero-state cmd.exe fallback: the launcher ITSELF was still
+`python3 -m chinamaxM.setup` run under an ambient interpreter — broken on a bare macOS (only the
+Xcode Command Line Tools stub at `/usr/bin/python3` exists, which errors or pops a GUI installer)
+and on the Windows re-run (`python3` never exists there; conda ships `python.exe`, installed
+`/AddToPath=0`). That residual ambient-`python3` launcher is **reversed**.
+
+The launcher is now the `scripts/chinamaxM` shim sourcing `scripts/_interpreter.sh`, THE single
+home of interpreter discovery (copied from the original plugin's `_interpreter.sh` pattern — a
+separate checkout, no cross-repo code import), with the pinned rungs, first that resolves winning:
+recorded `<claude-root>/chinamaxM/python-path` → `$CHINAMAXM_PYTHON` → `~/miniconda3/envs/chinamaxM`
+python → validated `conda run -n chinamaxM` (`--no-capture-output`) → base `~/miniconda3` python +
+`src/` on `PYTHONPATH` → ambient `python3` (POSIX) / `python` (Windows) + `src/` on `PYTHONPATH`.
+The base-`~/miniconda3` rung is what completes the Windows zero-state re-run with no PATH change.
+Making the recorded path win **reverses** the hook shims' previous env-var-first order (they
+resolved `$CHINAMAXM_PYTHON` before the recorded path) — deliberate, because one shared order for
+the launcher and all three hook shims beats three private ones.
+
+All command surfaces launch through the shim now — `/setup`, `/doctor`, `/profiles`, and `/task`'s
+`set_model` rewrite (the last was latently broken as a bare `python -m chinamaxM.set_model` with no
+`PYTHONPATH` and no env). The three hook shims (`session_start_hook`, `worker_contract_hook`,
+`codex_worker_contract_hook`) share rungs 1–3 plus the `conda run` helper and keep their fail-open
+`exit 0` contract and `conda run --no-capture-output` stdin semantics; hooks NEVER use the
+launcher's base-miniconda or ambient bootstrap rungs (5–6).
+
+macOS zero-state is **operator kick-back**, deliberately: the ambient rung refuses
+`/usr/bin/python3` unless `xcode-select -p` succeeds (GUI-safe — the CLT stub is never EXECUTED as a
+probe, since running it can pop the installer), prints install-it-yourself guidance (CLT / Homebrew
+/ python.org), and exits 1. No macOS zero-state install block exists: the engine-never-installs
+consent model extends to the launcher. The Windows zero-state cmd.exe block is unchanged. The POSIX
+miniconda Rectification row's first command is now curl-or-wget (minimal-image Linux without curl).

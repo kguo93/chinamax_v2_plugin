@@ -3,45 +3,36 @@
 # PINNED order, and run the module, which branches on the stdin hook_event_name. Registered
 # for SubagentStart (no matcher) and PreToolUse(Agent) in hooks/hooks.json.
 #
-# Interpreter resolution is PINNED and never probed beyond this order — the first is used:
-#   1) $CHINAMAXM_PYTHON                 (an absolute executable python)
-#   2) the setup-recorded python-path    (<claude-root>/chinamaxM/python-path)
-#   3) conda run -n chinamaxM python      (last resort — costs seconds per spawn)
-# There is no `set -e`: the module always exits 0, and the shim exits 0 unconditionally so
-# a hook fault can never block a tool call (fail-open).
+# Interpreter resolution is the shared _interpreter.sh rungs 1-3 (recorded python-path ->
+# $CHINAMAXM_PYTHON -> ~/miniconda3/envs/chinamaxM python), then a fail-open `conda run`:
+#   1) the setup-recorded python-path    (<claude-root>/chinamaxM/python-path)  [now FIRST]
+#   2) $CHINAMAXM_PYTHON                  (an absolute executable python)
+#   3) ~/miniconda3/envs/chinamaxM python (absolute env interpreter)
+#   4) conda run -n chinamaxM python      (last resort — costs seconds per spawn)
+# The RECORDED path now wins over $CHINAMAXM_PYTHON — a deliberate flip of the previous
+# shim-local order so all shims share ONE discovery order (ADR 0009 as amended 2026-08-14).
+# Hooks NEVER use the launcher's bootstrap/ambient rungs (5-6). There is no `set -e`: the
+# module always exits 0, and the shim exits 0 unconditionally so a hook fault can never block
+# a tool call (fail-open).
 set -uo pipefail
 
 MODULE="chinamaxM.hooks.worker_contract"
 payload="$(cat)"
 
-# Rungs 1-2: print an absolute executable python, or return 1 to fall through to conda.
-resolve_python() {
-  if [ -n "${CHINAMAXM_PYTHON:-}" ] && [ -x "${CHINAMAXM_PYTHON}" ]; then
-    printf '%s\n' "${CHINAMAXM_PYTHON}"
-    return 0
-  fi
-  local claude_root recorded_file recorded
-  claude_root="${CHINAMAXM_CLAUDE_HOME:-${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}}"
-  recorded_file="${claude_root}/chinamaxM/python-path"
-  if [ -f "${recorded_file}" ]; then
-    recorded="$(head -n1 "${recorded_file}" 2>/dev/null | tr -d '\r\n')"
-    if [ -n "${recorded}" ] && [ -x "${recorded}" ]; then
-      printf '%s\n' "${recorded}"
-      return 0
-    fi
-  fi
-  return 1
-}
+CHINAMAXM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck source=scripts/_interpreter.sh
+. "${CHINAMAXM_SCRIPT_DIR}/_interpreter.sh"
 
-if py="$(resolve_python)"; then
+if py="$(chinamaxm_resolve_python)"; then
   printf '%s' "${payload}" | "${py}" -m "${MODULE}"
   exit 0
 fi
 
-if command -v conda >/dev/null 2>&1; then
+conda_cmd="$(chinamaxm_conda_cmd || true)"
+if [ -n "${conda_cmd}" ]; then
   # `--no-capture-output` is REQUIRED: plain `conda run` swallows stdin, so the module
   # would read an empty event and inject nothing. It connects stdio directly instead.
-  printf '%s' "${payload}" | conda run --no-capture-output -n chinamaxM python -m "${MODULE}"
+  printf '%s' "${payload}" | "${conda_cmd}" run --no-capture-output -n chinamaxM python -m "${MODULE}"
   exit 0
 fi
 

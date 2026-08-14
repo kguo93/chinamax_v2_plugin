@@ -40,9 +40,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: any doctor/profiles output (ADR 0006's never-print rule).
 CANARY = "sk-" + "canary-NEVER-PRINT-2f9a"  # fragment-built so the secret sweep never trips
 
-#: The pinned CLI invocations the command files and Codex skill twins must both carry.
-DOCTOR_CLI = "conda run -n chinamaxM python -m chinamaxM.doctor"
-PROFILES_CLI = "conda run -n chinamaxM python -m chinamaxM.doctor --profiles"
+#: The pinned Launcher invocations the command files and Codex skill twins must both carry
+#: (the command uses ${CLAUDE_PLUGIN_ROOT}, the skill uses <plugin-checkout> — the shared
+#: substring is the shim subcommand line).
+DOCTOR_CLI = '/scripts/chinamaxM" doctor'
+PROFILES_CLI = '/scripts/chinamaxM" doctor --profiles'
 
 CP = subprocess.CompletedProcess
 

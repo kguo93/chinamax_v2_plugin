@@ -1,6 +1,6 @@
 {
   "name": "chinamaxm",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Expose non-Claude worker models as native subagents of Claude Code and Codex, routed through one local Proxy.",
   "author": {
     "name": "Kevin Guo"

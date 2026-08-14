@@ -6,10 +6,11 @@ The engine COMPOSES the machinery of the blocking slices — the hosts-04 doctor
 ops-01 supervision functions, and the :mod:`chinamaxM.settings_json` env-flip editor — and
 mutates nothing until an operator approves the rendered plan by its digest.
 
-Bootstrap: this module and its diagnose/plan phases run under the HOST's ambient
-interpreter (the ``chinamaxM`` conda env is an apply TARGET, never a prerequisite), so it
-imports nothing that needs the env's dependencies (aiohttp / litellm / PyYAML / tomlkit) at
-module load. Agent generation, which needs PyYAML + tomlkit, runs as a subprocess under the
+Bootstrap: this module and its diagnose/plan phases are launched by the plugin Launcher
+(``scripts/chinamaxM``), whose last rungs may resolve a bare bootstrap interpreter on a
+fresh machine (the ``chinamaxM`` conda env is an apply TARGET, never a prerequisite), so
+it imports nothing that needs the env's dependencies (aiohttp / litellm / PyYAML /
+tomlkit) at module load. Agent generation, which needs PyYAML + tomlkit, runs as a subprocess under the
 conda env (:func:`_run_generation` re-entered via ``--_run-generation``); tests inject an
 in-process generator instead.
 
@@ -41,7 +42,7 @@ from chinamaxM import settings_json
 
 # NOTE (Bootstrap): every OTHER chinamaxM import is LAZY — performed inside the method or
 # function that uses it — so ``import chinamaxM.setup`` and the ``--plan-only`` plan/render
-# path run under a bare ambient interpreter that lacks the env-only deps (aiohttp / litellm /
+# path run under a bare bootstrap interpreter (the Launcher's last rungs) that lacks the env-only deps (aiohttp / litellm /
 # PyYAML / tomlkit). settings_json is stdlib-only and safe to import at module load.
 
 #: The conda env Setup creates/targets and the Python it pins (ADR 0009 / ADR 0002).
@@ -886,7 +887,7 @@ class SetupEngine:
 
         ``-b -u`` reuses an existing/partial ``$HOME/miniconda3`` so a re-run after an
         interrupted install is idempotent. The final command runs conda init, which MODIFIES the
-        operator's shell startup files. curl is the row's dependency. An architecture absent from
+        operator's shell startup files. curl or wget is the row's dependency. An architecture absent from
         the normalization map yields an advice-only row with an empty ``commands`` and no
         download URL (never a 404-bound URL).
         """
@@ -912,17 +913,17 @@ class SetupEngine:
         installer = f"Miniconda3-latest-{os_tag}-{arch}.sh"
         url = f"{_MINICONDA_URL_BASE}{installer}"
         commands = [
-            f'curl -fsSL {url} -o "$HOME/.chinamaxM-miniconda.sh"',
+            f'if command -v curl >/dev/null 2>&1; then curl -fsSL {url} -o "$HOME/.chinamaxM-miniconda.sh"; else wget -qO "$HOME/.chinamaxM-miniconda.sh" {url}; fi',
             'bash "$HOME/.chinamaxM-miniconda.sh" -b -u -p "$HOME/miniconda3"',
             f'"$HOME/miniconda3/bin/conda" init {init_shells}',
         ]
         return {
             "name": "miniconda",
             "summary": (
-                f"install Miniconda ({installer}) into $HOME/miniconda3 with curl; -b -u "
+                f"install Miniconda ({installer}) into $HOME/miniconda3 with curl (or wget); -b -u "
                 "reuses an existing $HOME/miniconda3 so a re-run is idempotent. The final "
                 f"command runs conda init {init_shells}, which MODIFIES your shell startup "
-                f"files ({startup_files}). Requires curl."
+                f"files ({startup_files}). Requires curl or wget."
             ),
             "commands": commands,
             "run_policy": "agent",

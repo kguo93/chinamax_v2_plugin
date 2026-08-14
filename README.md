@@ -15,9 +15,12 @@ stands for improved.
   `approve`, and setup then runs them for you. A `miniconda` step runs `conda init`, which edits
   your shell startup files. On unsupported CPU architectures setup falls back to telling you to
   install Miniconda yourself.
-- **No pre-installed Python needed.** Setup does not require an existing Python — on a bare
-  Windows box it bootstraps Git for Windows and Miniconda straight from `cmd.exe` (winget + the
-  official Miniconda installer), then continues.
+- **No pre-installed Python needed on Windows; macOS needs one.** The launcher resolves
+  its own interpreter (setup-recorded env python → conda → bootstrap fallbacks). On a bare
+  Windows box it bootstraps Git for Windows and Miniconda straight from `cmd.exe` (winget +
+  the official Miniconda installer), then continues. On macOS, install a real Python 3
+  first (`xcode-select --install`, Homebrew, or python.org) — setup will not install it
+  for you.
 - **Claude Code and/or Codex** — the plugin installs on either host.
 - Linux, macOS, or Windows.
 
@@ -62,7 +65,9 @@ command that changes your machine, and it changes **nothing** until you approve.
 **Prerequisites first.** If a platform tool is missing (`bash`, Miniconda, or — on Windows —
 Git for Windows), setup pauses and shows you the exact install commands. Reply `approve` and it
 runs them for you in order (stopping on the first failure), then re-checks. The engine never
-downloads or runs an installer on its own — you approve each step.
+downloads or runs an installer on its own — you approve each step. On macOS, setup needs a real
+Python 3 already installed (the Apple CLT stub is refused) — install one first if the launcher
+says so.
 
 Once the prerequisites are in place, setup runs in two passes:
 

@@ -97,3 +97,12 @@ host-aware with a Codex twin — cross-ref ADR 0009 as amended 2026-08-14).**
   warn-only and fail-open; supervision is still the OS's job (ADR 0009). Registered symmetrically
   in `hooks/hooks.json` and `hooks/codex-hooks.json` (the latter with the Git-Bash
   `commandWindows` shim).
+
+**Amended 2026-08-14 (all command surfaces launch via the Launcher shim — cross-ref ADR 0009 as
+amended 2026-08-14).** Every command/skill surface — `/setup`, `/doctor`, `/profiles`, and
+`/task`'s `set_model` rewrite — now invokes `scripts/chinamaxM <subcommand>` instead of a
+hardcoded `python3 -m …` (setup), `conda run -n chinamaxM python -m …` (doctor/profiles), or bare
+`python -m …` (task's `set_model`) line. `commands/setup.md`'s `allowed-tools` is narrowed from
+`Bash` to `Bash(${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM:*)`. The interpreter-rung mechanics (the
+shared `scripts/_interpreter.sh` discovery order, the macOS operator kick-back, the Windows
+zero-state re-run) live in ADR 0009 (as amended 2026-08-14), which this cross-references.

@@ -91,3 +91,13 @@ _Avoid_: dependency (reserved for the Python packages in the env), requirement
 **Rectification row**:
 The plain dict setup EMITS for one missing Prerequisite on the current Platform — `{name, summary, commands, run_policy, shell, install_location}` (plus `missing_tools` on the Git for Windows row) — the single source of truth for how that Prerequisite gets installed. The Host agent runs a row's `commands` verbatim, dispatched by its `run_policy` (`agent` / `privileged` / `operator`) through its `shell` (`cmd` / `powershell` / `native` / `bash`), only after the operator approves; the setup engine never runs them. The `--plan-only` Phase-A pause carries these rows under the `prerequisite_fixes` key.
 _Avoid_: calling a row a "fix" in prose (the serialized key stays `prerequisite_fixes`, but the concept is a Rectification row), installer script
+
+**Launcher**:
+The single shim every host surface runs plugin Python through. It resolves the interpreter
+by one pinned rung order (shared with the hook shims), so no surface assumes an ambient
+Python.
+_Avoid_: "ambient Python" as a requirement (it is only the launcher's last bootstrap rung)
+
+**Recorded interpreter**:
+The interpreter path setup records after a successful apply — the first rung every shim
+consults. Absent until the first successful apply.

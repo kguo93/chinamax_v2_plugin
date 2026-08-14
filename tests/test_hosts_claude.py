@@ -135,7 +135,7 @@ def test_task_command_text_invariants():
 
     # Model pass-through: never validated, rewrite-helper invocation, verbatim provider error.
     assert "never validated" in lower
-    assert "python -m chinamaxM.set_model claude <profile> <model>" in text
+    assert '"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" set_model claude <profile> <model>' in text
     assert "verbatim as the Worker's error" in text
 
     # Named background spawn: default `<profile>-<n>`; custom name `<profile>-` + non-empty.
@@ -331,3 +331,53 @@ def test_hook_fail_open(tmp_path, missing_overlay):
     assert result.returncode == 0
     assert result.stdout.strip() == "", result.stdout
     assert result.stderr.strip() != ""
+
+
+# --------------------------------------------------- test 8b (recorded-path precedence)
+
+
+def test_hook_recorded_path_precedes_env_var(tmp_path, missing_overlay):
+    """AC (LIVE): the recorded python-path outranks $CHINAMAXM_PYTHON in the shared resolver.
+
+    The shim now shares ``scripts/_interpreter.sh`` with the launcher, whose rung order puts
+    the setup-recorded python-path FIRST (a deliberate flip of the previous shim-local
+    env-var-first order, ADR 0009 as amended 2026-08-14). Both rungs point at marking
+    wrappers; only the recorded one must run.
+    """
+    command = _command_for("SessionStart")
+    claude_home = tmp_path / "claude-home"
+    (claude_home / "chinamaxM").mkdir(parents=True)
+    recorded_marker = tmp_path / "recorded.ran"
+    envvar_marker = tmp_path / "envvar.ran"
+
+    def _wrapper(dest: Path, marker: Path) -> Path:
+        # Marks a marker file, then execs THIS interpreter so the real module still runs.
+        dest.write_text(
+            f'#!/bin/sh\ntouch "{marker}"\nexec "{sys.executable}" "$@"\n', encoding="utf-8"
+        )
+        dest.chmod(0o755)
+        return dest
+
+    recorded_py = _wrapper(tmp_path / "recorded-python", recorded_marker)
+    envvar_py = _wrapper(tmp_path / "envvar-python", envvar_marker)
+    (claude_home / "chinamaxM" / "python-path").write_text(
+        str(recorded_py) + "\n", encoding="utf-8"
+    )
+
+    env = os.environ.copy()
+    env["CLAUDE_PLUGIN_ROOT"] = str(REPO_ROOT)
+    env["CHINAMAXM_CLAUDE_HOME"] = str(claude_home)
+    env["CHINAMAXM_PYTHON"] = str(envvar_py)
+    env["CHINAMAXM_OVERLAY_PATH"] = missing_overlay
+    result = subprocess.run(
+        command,
+        shell=True,
+        input='{"hook_event_name":"SessionStart"}',
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert recorded_marker.exists(), "the recorded python-path wrapper did not run"
+    assert not envvar_marker.exists(), "$CHINAMAXM_PYTHON ran despite a recorded path"

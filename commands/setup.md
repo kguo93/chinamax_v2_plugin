@@ -1,15 +1,16 @@
 ---
 description: Set up chinamaxM — detect the platform prerequisites (bash / Git for Windows / Miniconda) and pause for approval before installing any that are missing, then the consent-gated diagnose → plan → approve → apply → re-diagnose → report. The one mutating surface.
-allowed-tools: Bash
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM:*)
 ---
 
 Set up (or tear down) the chinamaxM installation. This is the ONLY surface that mutates the
 machine, and it mutates NOTHING until the operator approves.
 
-Setup runs under the host's ambient Python (the `chinamaxM` conda env is what it CREATES, so
-it cannot require it). Launch it with the plugin source on the path:
+The launcher resolves its own interpreter (Recorded interpreter → conda env → bootstrap
+fallbacks — the pinned rungs live in `scripts/_interpreter.sh`); it needs no pre-set
+`PYTHONPATH` and no ambient `python3`:
 
-`PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/src" python3 -m chinamaxM.setup --plan-only`
+`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --plan-only`
 
 ## Flow — follow these steps in order
 
@@ -56,6 +57,12 @@ start /wait "" "%TEMP%\chinamaxM-miniconda.exe" /InstallationType=JustMe /Regist
 "%USERPROFILE%\miniconda3\Scripts\conda.exe" init cmd.exe powershell bash
 ```
 
+> macOS-only: if the launcher reports "no usable Python 3" (a bare Mac has only the Xcode
+> CLT stub), STOP. Tell the operator to install a real Python 3 themselves — any of
+> `xcode-select --install`, Homebrew (`brew install python3`), or the python.org installer —
+> then re-run setup. Do NOT install anything for them; there is no agent-run bootstrap on
+> macOS.
+
 ### B. The plan-only output is the normal plan (ends in a `Plan digest:` line)
 
 7. Show the operator the full plan and ask two SEPARATE questions (two distinct consents):
@@ -65,7 +72,7 @@ start /wait "" "%TEMP%\chinamaxM-miniconda.exe" /InstallationType=JustMe /Regist
 8. Only after the operator approves, apply with the digest from step 1 — append `--probes` only
    if they opted into probes:
 
-   `PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/src" python3 -m chinamaxM.setup --apply --plan-digest <digest>`
+   `"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --apply --plan-digest <digest>`
 
    Apply re-checks the plan digest and preconditions and ABORTS without mutating if anything
    drifted since step 1. Show the operator the full report (diagnosis before/after, per-step
@@ -78,8 +85,8 @@ agents are picked up.
 
 Removes ONLY the env flip and the service; keys, agents, and Linux linger are left in place:
 
-`PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/src" python3 -m chinamaxM.setup --teardown`  (renders plan + digest)
-`PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/src" python3 -m chinamaxM.setup --teardown --plan-digest <digest>`  (applies)
+`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --teardown`  (renders plan + digest)
+`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --teardown --plan-digest <digest>`  (applies)
 
 ## Notes
 
@@ -87,8 +94,9 @@ Removes ONLY the env flip and the service; keys, agents, and Linux linger are le
 - No command path ever prints an API-key value; probe failures show only the parsed error type/message.
 - Prerequisites: setup DETECTS `bash` / Git for Windows / Miniconda and, when any is missing,
   PAUSES with agent-run Rectification rows before any mutation — the engine never downloads or
-  runs an installer, and needs no pre-installed Python (on a bare Windows box the zero-state block
-  above bootstraps Git and Miniconda from cmd.exe). Git for Windows is bootstrapped because the
+  runs an installer. The launcher needs no pre-installed Python on Windows (the zero-state block
+  above bootstraps Git and Miniconda from cmd.exe); on macOS a real Python 3 must be installed by
+  the operator first (the launcher refuses the CLT stub). Git for Windows is bootstrapped because the
   Codex hooks need its bash. A `miniconda` row installs `Miniconda3-latest-*` (NO version pin, NO
   checksum) and runs `conda init`, which EDITS your shell startup files (both disclosed in the
   row's summary); it is idempotent (reuses an existing `~/miniconda3`). On an unsupported CPU

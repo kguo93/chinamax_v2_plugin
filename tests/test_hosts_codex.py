@@ -175,7 +175,7 @@ def test_codex_skill_delegation_language():
 
     # Role selection: explicit model ⇒ the codex rewrite helper; never validated.
     assert "never validated" in lower
-    assert "python -m chinamaxM.set_model codex <profile> <model>" in text
+    assert '"<plugin-checkout>/scripts/chinamaxM" set_model codex <profile> <model>' in text
 
     # Headless stdin-close guidance.
     assert "< /dev/null" in text
@@ -313,8 +313,8 @@ def test_surface_symmetry_with_claude():
         # Model never validated; provider errors relay verbatim.
         assert "never validated" in lower
         assert "verbatim as the Worker's error" in _flat(text)
-        # The shared rewrite helper (host token differs per surface).
-        assert "python -m chinamaxM.set_model" in text
+        # The shared rewrite helper via the Launcher (host token differs per surface).
+        assert '/scripts/chinamaxM" set_model' in text
         # Default and custom name rules.
         assert "<profile>-<n>" in text
         assert "<profile>-" in text
@@ -324,8 +324,8 @@ def test_surface_symmetry_with_claude():
 
     # The rewrite helper differs only in the host token — proving surface symmetry, not
     # a shared host.
-    assert "python -m chinamaxM.set_model codex <profile> <model>" in skill
-    assert "python -m chinamaxM.set_model claude <profile> <model>" in command
+    assert '"<plugin-checkout>/scripts/chinamaxM" set_model codex <profile> <model>' in skill
+    assert '"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" set_model claude <profile> <model>' in command
 
 
 # ------------------------------------------------------------- test 6 (manifest registration)
