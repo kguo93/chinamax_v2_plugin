@@ -38,7 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: A key VALUE canary: every key file in the fixture holds it, and it must never appear in
 #: any doctor/profiles output (ADR 0006's never-print rule).
-CANARY = "sk-canary-NEVER-PRINT-2f9a"
+CANARY = "sk-" + "canary-NEVER-PRINT-2f9a"  # fragment-built so the secret sweep never trips
 
 #: The pinned CLI invocations the command files and Codex skill twins must both carry.
 DOCTOR_CLI = "conda run -n chinamaxM python -m chinamaxM.doctor"

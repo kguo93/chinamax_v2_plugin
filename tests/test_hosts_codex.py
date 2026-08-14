@@ -329,14 +329,17 @@ def test_surface_symmetry_with_claude():
 
 
 def test_codex_manifest_registered():
-    """AC-6: the Codex plugin manifest registers codex-hooks.json with live, expandable shims."""
+    """AC-6: skills registered; codex-hooks.json default-discovered with live, expandable shims."""
     plugin = json.loads(CODEX_PLUGIN_JSON.read_text(encoding="utf-8"))
-    assert plugin["hooks"] == "./hooks/codex-hooks.json"
     assert plugin["skills"] == "./skills"
+    # The Codex plugin-creator validator rejects a top-level `hooks` key, so codex-hooks.json
+    # is default-discovered at ./hooks/codex-hooks.json instead — hosts-03's hooks stay
+    # registered without the (now-invalid) manifest pointer.
+    assert "hooks" not in plugin
 
-    # Resolve the hook manifest FROM the parsed plugin.json pointer (plugin-root expansion).
-    hooks_path = REPO_ROOT / plugin["hooks"].removeprefix("./")
-    assert hooks_path == CODEX_HOOKS_JSON
+    # Resolve the hook manifest at its default-discovery location.
+    hooks_path = CODEX_HOOKS_JSON
+    assert hooks_path.exists(), hooks_path
     hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
     events = hooks["hooks"]
     assert {"SubagentStart", "PreToolUse"} <= set(events)

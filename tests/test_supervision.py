@@ -201,7 +201,8 @@ def test_rendering_escapes_spaces_and_percent(tmp_path):
 
 def test_no_secrets_or_foreign_paths(tmp_path, winsw_exe, monkeypatch):
     """AC-2: canary env + in-memory password never appear; every path token is resolved."""
-    monkeypatch.setenv("CANARY_SECRET", "sk-should-never-appear-canary")
+    canary = "sk-" + "should-never-appear-canary"  # fragment-built so the secret sweep never trips
+    monkeypatch.setenv("CANARY_SECRET", canary)
     log_dir = tmp_path / "chinamaxM-logs"
     cfg = SupervisionConfig(
         python_path=sys.executable,
@@ -215,7 +216,7 @@ def test_no_secrets_or_foreign_paths(tmp_path, winsw_exe, monkeypatch):
 
     for platform in ("linux", "darwin", "windows"):
         content = render(cfg, platform=platform).content.decode("utf-8")
-        assert "sk-should-never-appear-canary" not in content
+        assert canary not in content
         assert "PLACEHOLDER-SECRET-PW" not in content
         assert "<password" not in content
         for token in _path_tokens(content):

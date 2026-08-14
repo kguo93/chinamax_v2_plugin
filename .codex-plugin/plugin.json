@@ -1,5 +1,21 @@
 {
-  "name": "chinamaxM",
-  "hooks": "./hooks/codex-hooks.json",
-  "skills": "./skills"
+  "name": "chinamaxm",
+  "version": "0.1.0",
+  "description": "Expose non-Claude worker models as native subagents of Claude Code and Codex, routed through one local Proxy.",
+  "homepage": "https://github.com/kguo93/chinamax_v2_plugin",
+  "repository": "https://github.com/kguo93/chinamax_v2_plugin",
+  "license": "GPL-2.0",
+  "author": {
+    "name": "Kevin Guo"
+  },
+  "skills": "./skills",
+  "interface": {
+    "displayName": "ChinamaXM",
+    "shortDescription": "Worker models as native subagents",
+    "longDescription": "Generate native Claude and Codex subagents for non-Claude worker models (DeepSeek, MiMo, GLM, MiniMax, Kimi, Qwen), each routed through one local Proxy to its provider.",
+    "developerName": "Kevin Guo",
+    "category": "Developer tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": "Use ChinamaXM to delegate a task to a non-Claude worker model as a native subagent."
+  }
 }
