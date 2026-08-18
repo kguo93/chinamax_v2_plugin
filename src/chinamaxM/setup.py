@@ -116,6 +116,14 @@ _PIP_TIMEOUT = 900.0
 _GENERATE_TIMEOUT = 180.0
 _CODEX_TIMEOUT = 60.0
 
+# ``codex exec`` reads its prompt from stdin when none is passed as an argument, and
+# ``_default_run`` closes stdin — so a promptless strict-config run ALWAYS exits non-zero,
+# emitting this on stderr, even when config.toml parses cleanly. Codex loads (and strictly
+# validates) config BEFORE it reads the prompt, so reaching this message means the strict
+# parse already succeeded; a genuine bad field aborts earlier with an "Error loading
+# config.toml" report instead. Verified against Codex CLI 0.147.0.
+_CODEX_NO_PROMPT = "No prompt provided via stdin"
+
 # Readiness poll (a cold litellm import routinely exceeds 5s — deadline 30s, backoff).
 _READINESS_DEADLINE = 30.0
 _READINESS_INITIAL_DELAY = 0.5
@@ -209,6 +217,7 @@ class Report:
     probe_results: list = field(default_factory=list)
     probes_skipped: str | None = None
     restart_instruction: str | None = None
+    notes: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- runner
@@ -444,52 +453,17 @@ def _windows_tool_present(name: str, platform: str) -> bool:
 # --------------------------------------------------------------------- generation seam
 
 
-def _run_generation(registry, roots: Mapping[str, Path], *, include_codex: bool) -> dict:
-    """Generate Worker agents — the SINGLE generation implementation (lazy generate import).
+def _run_generation(registry, roots: Mapping[str, Path], *, host: str) -> dict:
+    """Generate the invoking Host's Worker agents (the SINGLE generation implementation).
 
-    With ``include_codex`` the full hosts-01 :func:`regenerate` runs (Claude + Codex);
-    without it a Claude-only pass reuses hosts-01's ``expected_artifacts`` + marker rules so a
-    Claude-only machine's ``~/.codex`` is never fabricated (ADR 0004/0006).
+    Delegates to hosts-01 :func:`regenerate` scoped to ``host`` (ADR 0004/0006 as amended
+    2026-08-18): a Claude-host run writes only the Claude agent ``.md``s and never fabricates
+    ``~/.codex``; a Codex-host run writes only the provider entries + role TOMLs and never
+    touches the Claude agents dir.
     """
     from chinamaxM import generate  # lazy: needs the env's PyYAML + tomlkit
 
-    if include_codex:
-        return generate.regenerate(registry, roots)
-
-    # Reuse hosts-01's own read/marker/atomic-write helpers so this Claude-only branch
-    # stays byte-for-byte identical to regenerate's Claude loop (marker classification,
-    # byte-identical skip, mode-preserving atomic write, OSError-swallowing read).
-    claude_dir = Path(roots["claude"]) / "agents"
-    expected = generate.expected_artifacts(registry, roots)
-    claude_expected = {p: c for p, c in expected.items() if p.parent == claude_dir}
-    written: list[str] = []
-    skipped: list[str] = []
-    pruned: list[str] = []
-    conflicts: list[str] = []
-    for path, content in claude_expected.items():
-        current = generate._read_text(path) if path.exists() else None
-        if current is not None and not generate._has_marker(current):
-            conflicts.append(str(path))
-            continue
-        if current == content:
-            skipped.append(str(path))
-            continue
-        generate._atomic_write(path, content.encode("utf-8"))
-        written.append(str(path))
-    if claude_dir.is_dir():
-        for entry in sorted(claude_dir.iterdir()):
-            if not entry.is_file() or entry in claude_expected:
-                continue
-            text = generate._read_text(entry)
-            if text is not None and generate._has_marker(text):
-                entry.unlink()
-                pruned.append(str(entry))
-    return {
-        "written": sorted(written),
-        "skipped": sorted(skipped),
-        "pruned": sorted(pruned),
-        "conflicts": sorted(conflicts),
-    }
+    return generate.regenerate(registry, roots, host)
 
 
 def _generation_subprocess_main() -> int:
@@ -497,11 +471,11 @@ def _generation_subprocess_main() -> int:
     from chinamaxM.generate import resolve_roots
     from chinamaxM.registry import default_overlay_path, load_registry
 
-    include_codex = os.environ.get("CHINAMAXM_SETUP_INCLUDE_CODEX") == "1"
+    host = os.environ.get("CHINAMAXM_SETUP_HOST", "")
     try:
         registry = load_registry(overlay_path=default_overlay_path())
         roots = resolve_roots()
-        report = _run_generation(registry, roots, include_codex=include_codex)
+        report = _run_generation(registry, roots, host=host)
     except Exception as exc:  # noqa: BLE001 - report failure to the parent, never traceback
         sys.stderr.write(f"generation failed: {type(exc).__name__}: {exc}\n")
         return 1
@@ -518,6 +492,7 @@ class SetupEngine:
     def __init__(
         self,
         *,
+        host: str | None = None,
         claude_root: str | os.PathLike[str] | None = None,
         codex_root: str | os.PathLike[str] | None = None,
         overlay_path: str | os.PathLike[str] | None = None,
@@ -525,7 +500,7 @@ class SetupEngine:
         run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         diagnose: Callable[[], list] | None = None,
         prerequisites: Callable[[], dict[str, bool]] | None = None,
-        generate_fn: Callable[[object, Mapping[str, Path], bool], dict] | None = None,
+        generate_fn: Callable[[object, Mapping[str, Path], str], dict] | None = None,
         conda: object | None = None,
         service_status: Callable[[object], object] | None = None,
         service_install: Callable[[object], None] | None = None,
@@ -546,11 +521,15 @@ class SetupEngine:
         ensure_winsw: Callable[..., object] | None = None,
     ) -> None:
         # Bootstrap: import the composed modules lazily (never at module load).
-        from chinamaxM.keyfiles import resolve_host_root
+        from chinamaxM.keyfiles import resolve_host, resolve_host_root
         from chinamaxM.observability import resolve_log_path
         from chinamaxM.ops import supervision
         from chinamaxM.registry import load_registry
 
+        # The single Host this engine acts for (ADR 0005 as amended 2026-08-18). ``main``
+        # resolves it from ``--host`` / the ladder before construction; a bare fallback keeps
+        # the engine usable when a caller already knows its Host from the environment.
+        self._host = host if host is not None else resolve_host()
         self._claude_root = Path(claude_root) if claude_root is not None else resolve_host_root("claude")
         self._codex_root = Path(codex_root) if codex_root is not None else resolve_host_root("codex")
         self._overlay_path = (
@@ -606,6 +585,7 @@ class SetupEngine:
         from chinamaxM import doctor
 
         findings, _exit = doctor.run_doctor(
+            host=self._host,
             claude_root=str(self._claude_root),
             codex_root=str(self._codex_root),
             overlay_path=str(self._overlay_path),
@@ -615,12 +595,12 @@ class SetupEngine:
         )
         return findings
 
-    def _subprocess_generate(self, registry, roots: Mapping[str, Path], include_codex: bool) -> dict:
+    def _subprocess_generate(self, registry, roots: Mapping[str, Path], host: str) -> dict:
         """Run agent generation under the conda env (re-enter ``--_run-generation``)."""
         env = dict(os.environ)
         env["CHINAMAXM_CLAUDE_HOME"] = str(roots["claude"])
         env["CHINAMAXM_CODEX_HOME"] = str(roots["codex"])
-        env["CHINAMAXM_SETUP_INCLUDE_CODEX"] = "1" if include_codex else "0"
+        env["CHINAMAXM_SETUP_HOST"] = host
         cp = self._run(
             ["conda", "run", "-n", CONDA_ENV, "python", "-m", "chinamaxM.setup", "--_run-generation"],
             timeout=_GENERATE_TIMEOUT,
@@ -945,6 +925,29 @@ class SetupEngine:
             return None
         return [bool(st.installed), bool(st.enabled), bool(st.running)]
 
+    def _codex_wired(self) -> bool:
+        """Whether ``~/.codex/config.toml`` carries a generated ``chinamaxM-`` provider entry.
+
+        The Codex wiring indicator, mirroring the Claude flip: a Claude-host teardown reads it
+        to note when the shared service it removes still leaves Codex wired (ADR 0005 as
+        amended 2026-08-18). Parses with stdlib ``tomllib`` (bootstrap-safe); any read/parse
+        fault means "not wired".
+        """
+        import tomllib
+
+        from chinamaxM.generate import CONFIG_FILE_NAME, PROVIDER_PREFIX
+
+        config_path = self._codex_root / CONFIG_FILE_NAME
+        try:
+            text = config_path.read_text(encoding="utf-8")
+            parsed = tomllib.loads(text)
+        except (OSError, ValueError):
+            return False
+        providers = parsed.get("model_providers") if isinstance(parsed, dict) else None
+        return isinstance(providers, dict) and any(
+            str(key).startswith(PROVIDER_PREFIX) for key in providers
+        )
+
     def _registry_digest(self) -> str:
         profiles = [
             {
@@ -966,7 +969,7 @@ class SetupEngine:
             "conda_available": r.run("diagnostic", "pc:conda-available", self._conda.available),
             "conda_env_exists": r.run("diagnostic", "pc:conda-env-exists", self._conda.env_exists),
             "conda_env_python": r.run("diagnostic", "pc:conda-env-python", self._conda.env_python_version),
-            "codex_home_exists": r.run("diagnostic", "pc:codex-home", self._codex_root.exists),
+            "codex_wired": r.run("diagnostic", "pc:codex-wired", self._codex_wired),
             "settings_flip": r.run("diagnostic", "pc:settings-flip", self._read_settings_flip_state),
             "service": r.run("diagnostic", "pc:service", self._service_state),
             "linger_enabled": r.run("diagnostic", "pc:linger", self._linger_enabled) if is_linux else False,
@@ -983,11 +986,19 @@ class SetupEngine:
         canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def _artifact_paths(self, codex_present: bool) -> list[str]:
-        paths = [str(self._claude_root / "agents" / f"{p.name}.md") for p in self._registry.profiles.values()]
-        if codex_present:
-            paths += [str(self._codex_root / "agents" / f"{p.name}.toml") for p in self._registry.profiles.values()]
-            paths.append(str(self._codex_root / "config.toml"))
+    def _artifact_paths(self, host: str) -> list[str]:
+        """The whole-file generation targets for one Host (Claude ``.md``s, or Codex role
+        TOMLs + ``config.toml``)."""
+        if host == "claude":
+            return sorted(
+                str(self._claude_root / "agents" / f"{p.name}.md")
+                for p in self._registry.profiles.values()
+            )
+        paths = [
+            str(self._codex_root / "agents" / f"{p.name}.toml")
+            for p in self._registry.profiles.values()
+        ]
+        paths.append(str(self._codex_root / "config.toml"))
         return sorted(paths)
 
     def _scaffold_step(self, step_id: str, host: str, path: Path) -> PlanStep:
@@ -1038,7 +1049,6 @@ class SetupEngine:
         from chinamaxM.keyfiles import KEY_FILE_NAME
 
         steps: list[PlanStep] = []
-        codex_present = pc["codex_home_exists"]
 
         # (a) conda env — Miniconda is a Platform Prerequisite (ADR 0009 as amended
         # 2026-08-14): build_plan PAUSES on a missing miniconda Prerequisite before reaching
@@ -1086,20 +1096,23 @@ class SetupEngine:
             run=lambda e: e._apply_record_python_path(),
         ))
 
-        # (b) scaffold Key files (Codex only when the Codex home exists — ADR 0006).
-        steps.append(self._scaffold_step("scaffold-claude-key", "Claude", self._claude_root / KEY_FILE_NAME))
-        if codex_present:
+        # (b) scaffold the invoking Host's Key file only (ADR 0006 as amended 2026-08-18).
+        if self._host == "claude":
+            steps.append(self._scaffold_step("scaffold-claude-key", "Claude", self._claude_root / KEY_FILE_NAME))
+        else:
             steps.append(self._scaffold_step("scaffold-codex-key", "Codex", self._codex_root / KEY_FILE_NAME))
 
-        # (c) generation (Claude always; Codex + strict-config only with the Codex home).
+        # (c) generation — the invoking Host's artifacts only (ADR 0004 as amended 2026-08-18).
+        host_label = "Claude" if self._host == "claude" else "Codex"
         steps.append(PlanStep(
             id="generate", kind="mutating", action="GENERATE",
-            title="Generate Worker agents" + ("" if codex_present else " (Claude only — no Codex home)"),
-            targets=self._artifact_paths(codex_present),
-            descriptor={"op": "generate", "include_codex": codex_present, "artifacts": self._artifact_paths(codex_present)},
-            run=lambda e, inc=codex_present: e._apply_generate(inc),
+            title=f"Generate Worker agents ({host_label})",
+            targets=self._artifact_paths(self._host),
+            descriptor={"op": "generate", "host": self._host, "artifacts": self._artifact_paths(self._host)},
+            run=lambda e, h=self._host: e._apply_generate(h),
         ))
-        if codex_present:
+        # Codex strict-config validation runs only on a Codex-host setup.
+        if self._host == "codex":
             steps.append(PlanStep(
                 id="codex-validate", kind="mutating", action="VALIDATE",
                 title="Validate Codex config (codex exec --strict-config)",
@@ -1144,8 +1157,10 @@ class SetupEngine:
             run=lambda e: e._apply_readiness(),
         ))
 
-        # (f) env flip LAST — never overwrite a foreign ANTHROPIC_BASE_URL.
-        steps.append(self._env_flip_step(pc["settings_flip"]))
+        # (f) env flip LAST — Claude-host only (Codex rides its generated provider entries,
+        # there is no settings.json flip). Never overwrite a foreign ANTHROPIC_BASE_URL.
+        if self._host == "claude":
+            steps.append(self._env_flip_step(pc["settings_flip"]))
         return steps
 
     def _env_flip_step(self, flip_state: list) -> PlanStep:
@@ -1263,18 +1278,35 @@ class SetupEngine:
         status = scaffold_key_file(path, list(names))
         return f"Key file {status}: {path}"
 
-    def _apply_generate(self, include_codex: bool) -> str:
+    def _apply_generate(self, host: str) -> str:
         roots = {"claude": self._claude_root, "codex": self._codex_root}
-        report = self._generate_fn(self._registry, roots, include_codex)
+        report = self._generate_fn(self._registry, roots, host)
         written = report.get("written", []) if isinstance(report, dict) else []
-        return f"generated agents (written={len(written)}, include_codex={include_codex})"
+        return f"generated {host} agents (written={len(written)})"
 
     def _apply_codex_validate(self) -> str:
+        """Strictly validate the generated Codex ``config.toml``, spending no tokens.
+
+        A promptless ``codex exec`` never reaches the model, so it cannot exit 0: it fails
+        on the absent prompt (see :data:`_CODEX_NO_PROMPT`) AFTER the strict config parse
+        has already passed. That outcome counts as validated; any other non-zero exit is a
+        real config failure and carries the captured Codex report.
+
+        Returns:
+            A one-line outcome for the step report.
+
+        Raises:
+            SetupError: config.toml was rejected by this Codex version.
+        """
         env = dict(os.environ)
         env["CODEX_HOME"] = str(self._codex_root)
         cp = self._run(["codex", "exec", "--strict-config"], timeout=_CODEX_TIMEOUT, env=env)
-        if cp.returncode != 0:
-            raise SetupError(f"codex exec --strict-config failed (exit {cp.returncode})")
+        if cp.returncode != 0 and _CODEX_NO_PROMPT not in (cp.stderr or ""):
+            detail = (cp.stderr or cp.stdout or "").strip()
+            raise SetupError(
+                f"codex exec --strict-config failed (exit {cp.returncode})"
+                + (f": {detail}" if detail else "")
+            )
         return "Codex config validated (strict-config)"
 
     def _apply_service(self) -> str:
@@ -1338,21 +1370,23 @@ class SetupEngine:
         return self._run_probes(), None
 
     def _run_probes(self) -> list[ProbeResult]:
+        # Probes are NOT Host-scoped (ADR 0005 as amended 2026-08-18): from either Host's
+        # setup, every Profile is probed on BOTH ingresses — the shared Proxy serves both
+        # regardless of which Host ran setup, so both must be exercised.
         results: list[ProbeResult] = []
         port = self._registry.port
-        codex_present = self._codex_root.exists()
         for profile in self._registry.profiles.values():
             results.append(self._probe(
                 profile.name, "anthropic", f"http://127.0.0.1:{port}/v1/messages",
                 {"model": f"{profile.name}/{profile.default_model}", "max_tokens": 1,
                  "messages": [{"role": "user", "content": "ping"}]},
             ))
-            if codex_present:
-                results.append(self._probe(
-                    profile.name, "responses", f"http://127.0.0.1:{port}/openai/{profile.name}/responses",
-                    {"model": profile.default_model, "max_output_tokens": 1,
-                     "input": [{"role": "user", "content": "ping"}]},
-                ))
+            results.append(self._probe(
+                profile.name, "responses", f"http://127.0.0.1:{port}/openai/{profile.name}/responses",
+                {"model": profile.default_model, "max_output_tokens": 1,
+                 "input": [{"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "ping"}]}]},
+            ))
         return results
 
     def _probe(self, profile_name: str, ingress: str, url: str, body: dict) -> ProbeResult:
@@ -1379,22 +1413,13 @@ class SetupEngine:
         return Plan("teardown", preconditions, before, steps, self._compute_digest(preconditions, steps))
 
     def _build_teardown_steps(self, pc: dict) -> list[PlanStep]:
-        target = str(self._settings_path)
-        flip_state = pc["settings_flip"]
-        if flip_state[0] == "absent":
-            action, run = "SKIP", None
-        elif flip_state[0] == "unparseable":
-            action, run = "REMOVE", (lambda e: e._apply_remove_flip())
-        elif self._is_our_flip(flip_state[1]):
-            action, run = "REMOVE", (lambda e: e._apply_remove_flip())
+        # The invoking Host's unwire comes first (Claude: the settings flip; Codex: the
+        # generated provider entries), then the ALWAYS-removed shared steps (ADR 0005 as
+        # amended 2026-08-18): the shared Proxy service and the recorded interpreter.
+        if self._host == "claude":
+            steps = [self._env_flip_remove_step(pc["settings_flip"])]
         else:
-            action, run = "LEAVE-FOREIGN", None
-        steps = [PlanStep(
-            id="env-flip-remove", kind="mutating", action=action,
-            title="Remove the ANTHROPIC_BASE_URL env flip (only when it is ours)", targets=[target],
-            descriptor={"op": "remove-env-flip", "target": target, "state": flip_state[0]},
-            run=run,
-        )]
+            steps = [self._codex_unwire_step(pc["codex_wired"])]
         steps.append(PlanStep(
             id="service-teardown", kind="mutating", action="UNINSTALL",
             title="Uninstall the Proxy supervision service",
@@ -1411,6 +1436,36 @@ class SetupEngine:
         ))
         return steps
 
+    def _env_flip_remove_step(self, flip_state: list) -> PlanStep:
+        """The Claude-host teardown unwire: remove the ANTHROPIC_BASE_URL flip when it is ours."""
+        target = str(self._settings_path)
+        if flip_state[0] == "absent":
+            action, run = "SKIP", None
+        elif flip_state[0] == "unparseable":
+            action, run = "REMOVE", (lambda e: e._apply_remove_flip())
+        elif self._is_our_flip(flip_state[1]):
+            action, run = "REMOVE", (lambda e: e._apply_remove_flip())
+        else:
+            action, run = "LEAVE-FOREIGN", None
+        return PlanStep(
+            id="env-flip-remove", kind="mutating", action=action,
+            title="Remove the ANTHROPIC_BASE_URL env flip (only when it is ours)", targets=[target],
+            descriptor={"op": "remove-env-flip", "target": target, "state": flip_state[0]},
+            run=run,
+        )
+
+    def _codex_unwire_step(self, codex_wired: bool) -> PlanStep:
+        """The Codex-host teardown unwire: strip our ``chinamaxM-`` provider entries from
+        ``config.toml`` (only ours; SKIP when none are present)."""
+        target = str(self._codex_root / "config.toml")
+        return PlanStep(
+            id="codex-unwire", kind="mutating", action="REMOVE" if codex_wired else "SKIP",
+            title="Remove the generated chinamaxM- Codex provider entries (only ours)",
+            targets=[target],
+            descriptor={"op": "codex-unwire", "target": target, "wired": codex_wired},
+            run=(lambda e: e._apply_codex_unwire()) if codex_wired else None,
+        )
+
     def teardown(self, plan_digest: str) -> Report:
         """Verify the digest + preconditions, then run the two best-effort teardown steps."""
         plan = self.build_teardown_plan()
@@ -1424,11 +1479,42 @@ class SetupEngine:
         return Report(
             "teardown", exit_code, before_findings=plan.before_findings,
             step_results=step_results, after_findings=after,
+            notes=self._teardown_notes(plan.preconditions),
         )
+
+    def _teardown_notes(self, pc: dict) -> list[str]:
+        """Report notes for teardown: the shared Proxy service is ALWAYS removed, so warn when
+        the OTHER Host is still wired to it (ADR 0005 as amended 2026-08-18)."""
+        if self._host == "claude":
+            other, wired = "Codex", bool(pc.get("codex_wired"))
+        else:
+            flip = pc.get("settings_flip") or ["absent"]
+            other = "Claude"
+            wired = flip[0] == "present" and self._is_our_flip(flip[1])
+        if not wired:
+            return []
+        return [
+            f"the shared Proxy service was removed; the {other} Host is still wired to it "
+            f"(run teardown inside {other} to unwire it)"
+        ]
 
     def _apply_remove_flip(self) -> str:
         status = settings_json.remove_flip(self._settings_path, self._is_our_flip)
         return f"env flip {status}"
+
+    def _apply_codex_unwire(self) -> str:
+        """Strip the generated ``chinamaxM-`` provider entries from the Codex ``config.toml``.
+
+        Delegates to hosts-01's marker-safe remover so only our tables are deleted and every
+        other byte survives; an absent/entry-less config is a no-op.
+        """
+        from chinamaxM.generate import remove_provider_entries
+
+        roots = {"claude": self._claude_root, "codex": self._codex_root}
+        removed = remove_provider_entries(roots).get("removed", [])
+        if not removed:
+            return "no Codex provider entries to remove"
+        return f"removed {len(removed)} Codex provider entr" + ("y" if len(removed) == 1 else "ies")
 
     def _apply_service_teardown(self) -> str:
         self._service_teardown(self._status_cfg())
@@ -1562,6 +1648,9 @@ def render_report(report: Report) -> str:
                 f"  [{'PASS' if probe.ok else 'FAIL'}] {probe.profile} via {probe.ingress} "
                 f"ingress: {probe.detail}{usage}"
             )
+    for note in report.notes:
+        lines.append("")
+        lines.append(f"NOTE: {note}")
     if report.restart_instruction:
         lines.append("")
         lines.append(report.restart_instruction)
@@ -1597,6 +1686,10 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m chinamaxM.setup",
         description="chinamaxM consent-gated setup (diagnose → plan → approve → apply → re-diagnose → report).",
     )
+    parser.add_argument(
+        "--host", default=None,
+        help="claude or codex; defaults to the CHINAMAXM_HOST marker / plugin env evidence",
+    )
     parser.add_argument("--plan-only", action="store_true", help="render the plan and exit 0 without mutating")
     parser.add_argument("--apply", action="store_true", help="apply the approved plan (needs --plan-digest)")
     parser.add_argument("--teardown", action="store_true", help="plan/apply teardown (remove the flip + service)")
@@ -1612,7 +1705,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    engine_kwargs: dict[str, object] = {}
+    from chinamaxM.keyfiles import HostResolutionError, resolve_host
+
+    try:
+        host = resolve_host(args.host)
+    except HostResolutionError as exc:
+        sys.stderr.write(str(exc) + "\n")
+        return 2
+
+    engine_kwargs: dict[str, object] = {"host": host}
     if args.winsw_exe is not None:
         engine_kwargs["winsw_exe"] = args.winsw_exe
     if args.winsw_service_password_file is not None:

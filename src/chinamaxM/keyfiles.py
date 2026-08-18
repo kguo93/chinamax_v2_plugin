@@ -11,10 +11,68 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Iterable, Literal, Mapping
 
 #: The per-Host Key-file basename, beneath the resolved Host root.
 KEY_FILE_NAME = "model-keys.env"
+
+#: The Hosts a surface can act for, in the shared resolver's canonical order.
+_HOSTS = ("claude", "codex")
+
+
+class HostResolutionError(ValueError):
+    """Raised when the invoking Host cannot be resolved (never guessed).
+
+    Carried by every Host-scoped surface (setup / doctor / generation) so an
+    ambiguous or invalid Host request fails loudly rather than silently acting for
+    the wrong Host. The SessionStart hook catches it and exits silently (fail-open).
+    """
+
+
+def resolve_host(
+    explicit: str | None = None, environ: Mapping[str, str] | None = None
+) -> str:
+    """Resolve the single invoking Host by the ladder (ADR 0005 as amended 2026-08-18).
+
+    The ladder, first match wins: an explicit ``--host`` value → the ``CHINAMAXM_HOST``
+    env marker → Codex plugin evidence → Claude plugin evidence → a hard error. Codex
+    evidence outranks Claude's because Codex exposes Claude-compatible env aliases, so a
+    Claude-first probe would misread a Codex session as Claude. The marker is
+    ``CHINAMAXM_HOST`` — v1 owns ``CHINAMAX_*`` and the namespaces stay disjoint.
+
+    Args:
+        explicit: A caller-supplied Host (``--host``); validated and wins over everything.
+        environ: The environment mapping to read (defaults to ``os.environ``).
+
+    Returns:
+        ``"claude"`` or ``"codex"``.
+
+    Raises:
+        HostResolutionError: On an invalid ``explicit`` / marker value, or when no rung
+            of the ladder resolves.
+    """
+    env = os.environ if environ is None else environ
+
+    if explicit is not None and explicit.strip():
+        host = explicit.strip().lower()
+        if host not in _HOSTS:
+            raise HostResolutionError(f"unknown Host {explicit!r}; require --host claude|codex")
+        return host
+
+    marker = env.get("CHINAMAXM_HOST", "")
+    if marker and marker.strip():
+        host = marker.strip().lower()
+        if host not in _HOSTS:
+            raise HostResolutionError(f"invalid CHINAMAXM_HOST {marker!r}; require claude or codex")
+        return host
+
+    if any(env.get(name, "").strip() for name in ("PLUGIN_ROOT", "PLUGIN_DATA", "CODEX_HOME")):
+        return "codex"
+    if any(env.get(name, "").strip() for name in ("CLAUDE_PLUGIN_ROOT", "CLAUDE_CONFIG_DIR")):
+        return "claude"
+    raise HostResolutionError(
+        "cannot determine chinamaxM Host; pass --host claude|codex or set CHINAMAXM_HOST"
+    )
 
 
 def resolve_host_root(

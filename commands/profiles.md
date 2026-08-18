@@ -5,12 +5,12 @@ allowed-tools: Bash
 
 List the resolved chinamaxM Profiles and show the output to the operator. It prints each
 Profile's default model (plus the current model line when a dispatch rewrite made it differ),
-dialect, key variable name, and PRESENT/MISSING per Host key file. It NEVER prints a key
-value.
+dialect, key variable name, and PRESENT/MISSING for THIS Host's key file (the invoking Host
+only — the other Host never appears). It NEVER prints a key value.
 
 Run this via Bash and show the operator its complete output:
 
-`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" doctor --profiles`
+`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" doctor --profiles --host claude`
 
 An unreadable Registry prints one error line and exits nonzero.
 

@@ -107,6 +107,55 @@ hardcoded `python3 -m …` (setup), `conda run -n chinamaxM python -m …` (doct
 shared `scripts/_interpreter.sh` discovery order, the macOS operator kick-back, the Windows
 zero-state re-run) live in ADR 0009 (as amended 2026-08-14), which this cross-references.
 
+**Amended 2026-08-18 (operator grilling: every surface is Host-scoped; Host-resolution
+ladder; probes cover both ingresses; teardown gains the Codex unwire — cross-ref ADRs
+0004/0006/0009 as amended 2026-08-18).** The symmetric surfaces are now **Host-scoped**:
+each surface acts for the single Host that invoked it, resolved once per process by the
+**Host-resolution ladder** — explicit `--host claude|codex` → the `CHINAMAXM_HOST` env
+marker → Codex plugin evidence → Claude plugin evidence (Codex wins ties: it exposes
+Claude-compatible aliases) → hard error, never a guess. The shipped command/skill
+surfaces pass `--host` explicitly (Claude command files `--host claude`, Codex skill
+files `--host codex`), mirroring the original plugin's pattern. The marker is
+deliberately `CHINAMAXM_HOST`, disjoint from the original plugin's `CHINAMAX_*`
+namespace, so a coexisting v1 install (whose surfaces export `CHINAMAX_HOST`) can never
+steer v2's resolution.
+
+- **Setup is Host-scoped.** The original roster read "scaffold BOTH key files (Codex
+  file only when `~/.codex` exists — ADR 0006); generate Claude agents; generate Codex
+  artifacts when `~/.codex` exists (ADR 0004) and validate with `codex exec
+  --strict-config`", and the Claude `settings.json` env flip ran unconditionally.
+  **Reversed**: setup plans the shared infrastructure from EITHER Host (conda env,
+  pinned deps, recorded interpreter, Proxy service install/update, Linux linger,
+  readiness — each already idempotent/create-only, so a second Host's run emits
+  SKIP/UPDATE rows and installs nothing twice) plus ONLY the invoking Host's wiring:
+  a Claude run = Claude Key file + Claude Generated agents + the `ANTHROPIC_BASE_URL`
+  flip; a Codex run = Codex Key file + Codex provider entries/role TOMLs +
+  `codex exec --strict-config` validation. The `~/.codex`-existence gate is retired; a
+  dual-Host operator runs `/setup` once inside each Host; no cross-host hint rows exist.
+- **Live probes are NOT host-scoped — the Responses gate is reversed.** The original
+  read "PLUS one minimal request through the Responses ingress … when `~/.codex`
+  exists". **Reversed**: probes are a whole-Proxy verification — per Profile, one
+  Anthropic-ingress probe AND one Responses-ingress probe (through the real LiteLLM
+  Seam), from EITHER Host's setup, unconditionally (the Proxy always serves both
+  ingresses).
+- **Doctor is Host-scoped.** The FAIL/WARN roster covers the shared infrastructure
+  (Registry, env + deps, service, port, log-path/linger info) plus the invoking Host's
+  wiring only — Claude: flip, Claude agent sync, Claude Key names,
+  `CLAUDE_CODE_SUBAGENT_MODEL`; Codex: strict-config, role/provider sync, Codex Key
+  names, pinned-Codex-CLI-version drift. The other Host's artifacts, keys, and sync
+  NEVER appear in the report; the Seam-level kimi-k3 WARN is shared and stays on both.
+- **`/profiles` is Host-scoped**: key PRESENT/MISSING for the invoking Host's Key file
+  only.
+- **Teardown: symmetric unwire, shared always removed.** The Claude flip removal keeps
+  its only-when-ours guard; teardown gains the missing Codex twin — on a Codex-host
+  teardown, remove the generated `model_providers.chinamaxM-<profile>` entries from
+  `~/.codex/config.toml` (only ours, same guard spirit). The shared service + recorded
+  interpreter are ALWAYS removed regardless of the other Host's wiring (teardown is a
+  machine-level Proxy uninstall; the report says so when the other Host was wired).
+- **SessionStart adopts the same ladder** (minus the flag), replacing its Claude-first
+  default-claude sniffing; being warn-only it stays fail-open — unresolvable means exit
+  silently, never guess (ADR 0009 as amended 2026-08-18).
+
 **Amended 2026-08-18 (Worker instance-name grammar — cross-ref ADR 0004 as amended
 2026-08-18).** Two naming sentences here are superseded. The original `/task` bullet read
 "Spawns the matching Generated agent as a **named background subagent** (default name

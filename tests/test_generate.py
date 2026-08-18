@@ -27,6 +27,7 @@ from chinamaxM.generate import (
     expected_artifacts,
     matches_generated_agent,
     regenerate,
+    remove_provider_entries,
     resolve_roots,
     set_model,
 )
@@ -476,3 +477,75 @@ def test_set_model_rewrites_model_line(roots):
     regenerate(registry, roots)
     assert _frontmatter(md.read_text())["model"] == "deepseek/deepseek-v4-pro[1m]"
     assert tomllib.loads(toml.read_text())["model"] == "deepseek-v4-pro[1m]"
+
+
+# ------------------------------------------------- host-scoped generation (ADR 0004 amended)
+
+_SEED = ("deepseek", "mimo", "glm", "minimax", "kimi", "qwen")
+
+
+def test_regenerate_claude_host_writes_no_codex_artifacts(roots):
+    """regenerate(host='claude') writes ONLY Claude agents; the Codex root is never touched."""
+    report = regenerate(load_registry(), roots, "claude")
+    assert {p.name for p in (roots["claude"] / "agents").iterdir()} == {f"{n}.md" for n in _SEED}
+    assert all(w.endswith(".md") for w in report["written"])
+    # No Codex artifacts at all — the Codex home is never fabricated.
+    assert not (roots["codex"] / "agents").exists()
+    assert not (roots["codex"] / "config.toml").exists()
+
+
+def test_regenerate_codex_host_writes_no_claude_artifacts(roots):
+    """regenerate(host='codex') writes ONLY Codex role TOMLs + provider entries; no Claude agents."""
+    report = regenerate(load_registry(), roots, "codex")
+    assert {p.name for p in (roots["codex"] / "agents").iterdir()} == {f"{n}.toml" for n in _SEED}
+    assert (roots["codex"] / "config.toml").exists()
+    assert not any(w.endswith(".md") for w in report["written"])
+    # No Claude agents dir fabricated.
+    assert not (roots["claude"] / "agents").exists()
+    config = tomllib.loads((roots["codex"] / "config.toml").read_text())
+    assert set(config["model_providers"]) == {f"chinamaxM-{n}" for n in _SEED}
+
+
+def test_remove_provider_entries_only_ours(roots):
+    """remove_provider_entries strips only chinamaxM- tables; foreign + unrelated content survives."""
+    regenerate(load_registry(), roots, "codex")
+    config_path = roots["codex"] / "config.toml"
+    config_path.write_text(
+        config_path.read_text()
+        + '\n[model_providers.acme]\nname = "acme"\nbase_url = "http://example.com"\n'
+        + '\n[history]\npersistence = "save-all"\n',
+        encoding="utf-8",
+    )
+    result = remove_provider_entries(roots)
+    assert result["removed"] == sorted(f"model_providers.chinamaxM-{n}" for n in _SEED)
+    after = config_path.read_text()
+    assert "chinamaxM-" not in after
+    assert "acme" in after and "http://example.com" in after
+    assert "[history]" in after and 'persistence = "save-all"' in after
+
+
+def test_remove_provider_entries_noop_when_none_ours(roots):
+    """An absent config, or one with no chinamaxM- entries, is a byte-identical no-op."""
+    assert remove_provider_entries(roots) == {"removed": []}  # nothing generated yet
+    config_path = roots["codex"] / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text('[model_providers.acme]\nname = "acme"\n', encoding="utf-8")
+    before = config_path.read_text()
+    assert remove_provider_entries(roots) == {"removed": []}
+    assert config_path.read_text() == before
+
+
+def test_detect_drift_host_scoped(roots):
+    """detect_drift(host=...) reports only that Host's artifacts."""
+    regenerate(load_registry(), roots, "claude")  # only Claude artifacts exist
+    registry = load_registry()
+
+    # Claude scope: in sync (all six Claude agents present), no provider labels leak in.
+    claude = detect_drift(registry, roots, "claude")
+    assert claude["missing"] == [] and claude["stale"] == []
+    assert all(not item.startswith("model_providers.") for bucket in ("missing", "stale") for item in claude[bucket])
+
+    # Codex scope: everything missing (role TOMLs + provider tables), no Claude paths.
+    codex = detect_drift(registry, roots, "codex")
+    assert any(item.startswith("model_providers.") for item in codex["missing"])
+    assert all(not item.endswith(".md") for item in codex["missing"])

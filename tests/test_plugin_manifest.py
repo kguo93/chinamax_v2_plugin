@@ -36,7 +36,7 @@ GITHUB_URL = "https://github.com/kguo93/chinamax_v2_plugin"
 #: Kevin Guo, the single author/owner across every manifest.
 AUTHOR = {"name": "Kevin Guo"}
 #: The synchronized version every version-bearing location must carry.
-VERSION = "0.1.7"
+VERSION = "0.2.1"
 #: Kebab-case grammar the Codex plugin spec and the old-repo test both require of every
 #: plugin and marketplace name (``chinamaxm`` / ``chinamaxm-plugin`` pass; a styled
 #: ``chinamaxM`` fails). This is the naming gate — ``claude plugin validate --strict``

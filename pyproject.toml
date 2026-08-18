@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chinamaxM"
-version = "0.1.7"
+version = "0.2.1"
 description = "Expose non-Claude worker models as native subagents of Claude Code and Codex, routed through one local Proxy."
 license = "GPL-2.0-only"
 authors = [{name = "Kevin Guo"}]

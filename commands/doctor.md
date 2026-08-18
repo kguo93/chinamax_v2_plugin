@@ -8,7 +8,7 @@ free, local, token-less, mutation-less, Anthropic-surfaces-only.
 
 Run this via Bash and show the operator its complete output:
 
-`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" doctor`
+`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" doctor --host claude`
 
 The doctor exits nonzero when at least one FAIL-level check failed; WARN-only and info
 findings exit zero. Report the findings as-is — do not summarize away FAIL lines.

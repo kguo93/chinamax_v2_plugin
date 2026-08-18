@@ -10,7 +10,7 @@ The launcher resolves its own interpreter (Recorded interpreter → conda env �
 fallbacks — the pinned rungs live in `scripts/_interpreter.sh`); it needs no pre-set
 `PYTHONPATH` and no ambient `python3`:
 
-`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --plan-only`
+`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --plan-only --host claude`
 
 ## Flow — follow these steps in order
 
@@ -72,7 +72,7 @@ start /wait "" "%TEMP%\chinamaxM-miniconda.exe" /InstallationType=JustMe /Regist
 8. Only after the operator approves, apply with the digest from step 1 — append `--probes` only
    if they opted into probes:
 
-   `"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --apply --plan-digest <digest>`
+   `"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --apply --plan-digest <digest> --host claude`
 
    Apply re-checks the plan digest and preconditions and ABORTS without mutating if anything
    drifted since step 1. Show the operator the full report (diagnosis before/after, per-step
@@ -83,10 +83,13 @@ agents are picked up.
 
 ## Teardown
 
-Removes ONLY the env flip and the service; keys, agents, and Linux linger are left in place:
+Host-scoped: removes the Claude env flip, the shared Proxy service, and the recorded
+interpreter; keys, agents, and Linux linger are left in place. The Proxy service is SHARED —
+if Codex was also wired, tearing down here removes its Proxy too, and the report says so
+(run teardown inside Codex to unwire its provider entries).
 
-`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --teardown`  (renders plan + digest)
-`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --teardown --plan-digest <digest>`  (applies)
+`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --teardown --host claude`  (renders plan + digest)
+`"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" setup --teardown --plan-digest <digest> --host claude`  (applies)
 
 ## Notes
 

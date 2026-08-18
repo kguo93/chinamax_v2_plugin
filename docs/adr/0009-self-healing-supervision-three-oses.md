@@ -153,3 +153,13 @@ probe, since running it can pop the installer), prints install-it-yourself guida
 / python.org), and exits 1. No macOS zero-state install block exists: the engine-never-installs
 consent model extends to the launcher. The Windows zero-state cmd.exe block is unchanged. The POSIX
 miniconda Rectification row's first command is now curl-or-wget (minimal-image Linux without curl).
+
+**Amended 2026-08-18 (SessionStart resolves the Host by the shared ladder — cross-ref ADR 0005
+as amended 2026-08-18).** The 2026-08-14 amendment above made SessionStart host-aware via env
+sniffing that checked Claude evidence FIRST and defaulted to claude when nothing matched.
+**Reversed in ordering and fallback**: the hook now resolves through the shared Host-resolution
+ladder (flag-less: the `CHINAMAXM_HOST` marker → Codex plugin evidence → Claude plugin
+evidence), Codex-first because Codex exposes Claude-compatible env aliases — the original
+plugin's proven ordering. Being warn-only, the hook stays fail-open: when nothing resolves it
+exits silently instead of assuming claude. Both Hosts' warn conditions themselves are
+unchanged.

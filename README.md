@@ -88,6 +88,13 @@ When setup finishes, **restart any open host sessions** so the new worker subage
 
 Re-running setup is safe — it only fills in what is missing.
 
+**Setup is host-scoped.** Run inside Claude Code, it wires Claude (the key file, the Claude
+worker subagents, and the `ANTHROPIC_BASE_URL` flip); run inside Codex, it wires Codex (the
+key file, the Codex worker roles, and the `~/.codex/config.toml` providers). The shared proxy
+infrastructure (conda env, proxy, OS service) converges the same either way. **If you use both
+hosts, run setup once inside each** — a Claude setup never touches Codex's wiring, and vice
+versa.
+
 ## 3. Add your API keys
 
 Each worker needs its provider's key. Setup creates a per-host key file with the lines
@@ -185,6 +192,10 @@ codex plugin add chinamaxm@chinamaxm-plugin
 
 ## Uninstall / teardown
 
-Run `/chinamaxm:setup` and choose teardown. It removes the `ANTHROPIC_BASE_URL` flip and
-the proxy service; it leaves your keys, generated agents, and Linux linger in place. Like
-setup, it shows a plan and waits for your approval before touching anything.
+Run `/chinamaxm:setup` and choose teardown. It is host-scoped: inside Claude it removes the
+`ANTHROPIC_BASE_URL` flip; inside Codex it removes the generated `chinamaxM-*` providers from
+`~/.codex/config.toml`. Either way it removes the shared proxy service and the recorded
+interpreter, and leaves your keys, generated agents, and Linux linger in place. The proxy
+service is shared — if the other host is still wired to it, teardown says so (run teardown
+inside that host too). Like setup, it shows a plan and waits for your approval before touching
+anything.

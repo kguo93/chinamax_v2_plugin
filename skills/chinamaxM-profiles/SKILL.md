@@ -7,17 +7,18 @@ description: List the resolved chinamaxM Profiles and per-Host key presence (nev
 
 The Codex twin of `/chinamaxM:profiles`. List the resolved chinamaxM Profiles and show the
 output to the operator. It prints each Profile's default model (plus the current model line
-when a dispatch rewrite made it differ), dialect, key variable name, and PRESENT/MISSING per
-Host key file. It NEVER prints a key value.
+when a dispatch rewrite made it differ), dialect, key variable name, and PRESENT/MISSING for
+THIS Host's key file (the invoking Host only — the other Host never appears). It NEVER prints a
+key value.
 
 Run this and show the operator its complete output:
 
-`"<plugin-checkout>/scripts/chinamaxM" doctor --profiles`
+`"<plugin-checkout>/scripts/chinamaxM" doctor --profiles --host codex`
 
 For a headless run, close stdin by appending `< /dev/null` (`codex exec` blocks on an open
 pipeline stdin):
 
-`"<plugin-checkout>/scripts/chinamaxM" doctor --profiles < /dev/null`
+`"<plugin-checkout>/scripts/chinamaxM" doctor --profiles --host codex < /dev/null`
 
 An unreadable Registry prints one error line and exits nonzero.
 

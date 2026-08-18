@@ -81,6 +81,39 @@ canary-evidence paragraph is to be extended on the next live run to record expli
 whether consecutive same-role messages and parallel tool-call shapes are accepted on all
 six gateways (the 2026-08-13 canary proved verbatim replay, not those shapes).
 
+**Amended 2026-08-18 (the Seam is never stricter than the API it emulates).** An input
+item that carries no `type` is read as a `message`, not rejected. The Responses API makes
+`type` optional on an input message — every other item type (`reasoning`,
+`function_call`, `function_call_output`) carries it, so the omission is unambiguous — and
+a Seam that 400s where the emulated API accepts is a chinamaxM bug, not strictness. Found
+by the setup live probe (ADR 0005), which was itself sending the loose shape
+`{"role":"user","content":"ping"}` and so 400'd on all six Profiles while real Codex
+traffic passed; the probe now sends Codex's own wire shape (typed message, `input_text`
+content), so a green probe proves the path Codex actually uses. Grouping is unaffected: a
+defaulted item joins the same-type run it would have joined had the `type` been written
+out, so append-only and prefix stability hold.
+
+**Amended 2026-08-18 (output runs are hoisted past interleaved items — same-type-run
+grouping alone proved insufficient).** The 2026-08-13 amendment above read: "parallel
+tool calls require all of one assistant turn's `tool_use` blocks in one message and
+their `tool_result`s in the next user message (Anthropic adjacency); run grouping
+preserves strict append-only". Run grouping scanned strictly CONSECUTIVE items, so a
+Host-injected message BETWEEN two of a run's outputs split the output run and the Seam
+emitted `assistant[tool_use A, tool_use B] → user[result A] → user[result B]` — exactly
+what the adjacency rule forbids. Live failure 2026-08-18 08:03:17: a Codex deepseek
+Worker's parallel `exec_command` turn had the operator's PreToolUse hook
+additionalContext land as a developer message between the outputs (child rollout
+`…01a013e5-2ef2…`), and DeepSeek 400'd with `messages.4: tool_use ids were found
+without tool_result blocks immediately after`. **Extension**: before grouping, a call
+run's outputs are hoisted ahead of ANY items interleaved among them (system/developer
+AND user-role messages alike, per the 2026-08-18 grilling) so the grouped results are
+always the one message immediately after their `tool_use` turn; the interleaved items
+keep their relative order after it — a folded system/developer message still lands in
+top-level `system`, a user message becomes its own message following the results, never
+merged into them. The hoist is a deterministic pure function of the item-list prefix, so
+append-only and prefix-cache stability hold; run isolation (one litellm transform per
+run) is unchanged.
+
 **Kimi-k3 Responses bug (now precisely located).** litellm has NO Responses config for
 moonshot: a Responses-path call for kimi silently degrades to a **chat-completions**
 egress (untracked in upstream issue #33921; kimi-k3 absent from litellm's model map).

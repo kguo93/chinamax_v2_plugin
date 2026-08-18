@@ -36,3 +36,14 @@ level — a missing key degrades one Profile, it doesn't break the installation)
   is stale (ADR 0002: LiteLLM is never the HTTP client) and is **overridden**: on
   translated branches the Proxy injects the key into its OWN egress client, exactly as
   on the relay branch.
+
+**Amended 2026-08-18 (Key-file scaffolding is Host-scoped — cross-ref ADR 0005 as amended
+2026-08-18).** The original decision read "Both are O_EXCL-scaffolded comments-only
+templates". **Reversed on the WHO**: setup scaffolds ONLY the invoking Host's Key file
+(a Claude run → `~/.claude/model-keys.env`; a Codex run → `~/.codex/model-keys.env`),
+and the `~/.codex`-existence gate is retired with it — the file exists because that
+Host's setup ran, not because the home directory was spotted. Everything else stands:
+O_EXCL comments-only scaffolding (a v1-populated file is never clobbered — the step
+SKIPs when the file exists), the Proxy remains the only reader of key VALUES and still
+loads whichever of the two files exist, choosing by the request's ingress Host, and
+doctor/`/profiles` PRESENT/MISSING reporting is now per-invoking-Host (ADR 0005).

@@ -117,6 +117,22 @@ async def test_seam_full_shape(make_seam_client):
     assert "web_search" not in json.dumps(sent)  # the non-function tool never crossed
 
 
+async def test_input_item_without_a_type_is_a_message(make_seam_client):
+    """A `type`-less input item translates exactly as the same item with type:"message"."""
+    client, fake = await make_seam_client("glm")
+    fake.respond(headers=JSON_HEADERS, body=message_bytes([{"type": "text", "text": "ok"}]))
+
+    typed = user_text("ping")
+    bare = {key: value for key, value in typed.items() if key != "type"}
+    for item in (bare, typed):
+        response = await client.send({"model": "glm-5.2", "input": [item]})
+        assert response.status == 200
+
+    from_bare = json.loads(fake.requests[0].body)["messages"]
+    assert from_bare[0]["role"] == "user"
+    assert from_bare == json.loads(fake.requests[1].body)["messages"]
+
+
 async def test_stripped_tools_recorded(make_seam_client):
     """AC-2: the injectable log sink receives the stripped tool types (proxy-04's boundary)."""
     records: list[dict] = []
@@ -296,6 +312,81 @@ async def test_parallel_tool_calls_grouping(make_seam_client):
 
     # The following turn appends without rewriting those bytes.
     await client.send({"model": "glm-5.2", "input": base + [assistant_text("done")]})
+    next_messages = json.loads(fake.requests[1].body)["messages"]
+    assert messages == next_messages[: len(messages)]
+
+
+async def test_output_run_split_by_developer_message_regroups(make_seam_client):
+    """A developer message interleaved between a run's outputs never splits the result run.
+
+    Live shape from the 2026-08-18 Codex incident: a PreToolUse hook's additionalContext
+    lands as a developer message between two parallel-call outputs; the grouped results
+    must still be the single message immediately after their tool_use turn.
+    """
+    client, fake = await make_seam_client("deepseek")
+    fake.respond(headers=JSON_HEADERS, body=message_bytes([{"type": "text", "text": "ok"}]))
+
+    hook_notice = {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": "STOP - hook notice"}],
+    }
+    base = [
+        user_text("both please"),
+        {"type": "function_call", "call_id": "c1", "name": "get_weather", "arguments": '{"q":"A"}'},
+        {"type": "function_call", "call_id": "c2", "name": "get_time", "arguments": '{"q":"B"}'},
+        {"type": "function_call_output", "call_id": "c1", "output": "A-sunny"},
+        hook_notice,
+        {"type": "function_call_output", "call_id": "c2", "output": "B-noon"},
+    ]
+    await client.send({"model": "deepseek-v4-pro[1m]", "input": base})
+    body = json.loads(fake.requests[0].body)
+    messages = body["messages"]
+
+    assistant_index = next(i for i, m in enumerate(messages) if m["role"] == "assistant")
+    results_msg = messages[assistant_index + 1]
+    assert results_msg["role"] == "user"
+    results = [block for block in results_msg["content"] if block["type"] == "tool_result"]
+    assert [block["tool_use_id"] for block in results] == ["c1", "c2"]
+
+    # The hook text folds into the top-level system, never into a message.
+    assert "hook notice" in json.dumps(body.get("system", []))
+    assert all("hook notice" not in json.dumps(m) for m in messages)
+
+    # The following turn appends without rewriting those bytes.
+    await client.send({"model": "deepseek-v4-pro[1m]", "input": base + [assistant_text("done")]})
+    next_messages = json.loads(fake.requests[1].body)["messages"]
+    assert messages == next_messages[: len(messages)]
+
+
+async def test_output_run_split_by_user_message_defers(make_seam_client):
+    """A user message interleaved between a run's outputs defers to after the grouped results."""
+    client, fake = await make_seam_client("deepseek")
+    fake.respond(headers=JSON_HEADERS, body=message_bytes([{"type": "text", "text": "ok"}]))
+
+    base = [
+        user_text("both please"),
+        {"type": "function_call", "call_id": "c1", "name": "get_weather", "arguments": '{"q":"A"}'},
+        {"type": "function_call", "call_id": "c2", "name": "get_time", "arguments": '{"q":"B"}'},
+        {"type": "function_call_output", "call_id": "c1", "output": "A-sunny"},
+        user_text("keep working"),
+        {"type": "function_call_output", "call_id": "c2", "output": "B-noon"},
+    ]
+    await client.send({"model": "deepseek-v4-pro[1m]", "input": base})
+    messages = json.loads(fake.requests[0].body)["messages"]
+
+    assistant_index = next(i for i, m in enumerate(messages) if m["role"] == "assistant")
+    results_msg = messages[assistant_index + 1]
+    assert results_msg["role"] == "user"
+    results = [block for block in results_msg["content"] if block["type"] == "tool_result"]
+    assert [block["tool_use_id"] for block in results] == ["c1", "c2"]
+
+    deferred = messages[assistant_index + 2]
+    assert deferred["role"] == "user"
+    assert "keep working" in json.dumps(deferred)
+
+    # The following turn appends without rewriting those bytes.
+    await client.send({"model": "deepseek-v4-pro[1m]", "input": base + [assistant_text("done")]})
     next_messages = json.loads(fake.requests[1].body)["messages"]
     assert messages == next_messages[: len(messages)]
 

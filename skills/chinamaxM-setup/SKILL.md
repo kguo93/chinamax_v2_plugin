@@ -13,7 +13,7 @@ fallbacks — the pinned rungs live in `scripts/_interpreter.sh`); it needs no p
 `PYTHONPATH` and no ambient `python3`. Close stdin on any headless run (`codex exec` blocks on
 an open pipeline stdin):
 
-`"<plugin-checkout>/scripts/chinamaxM" setup --plan-only < /dev/null`
+`"<plugin-checkout>/scripts/chinamaxM" setup --plan-only --host codex < /dev/null`
 
 ## Flow — follow these steps in order
 
@@ -47,8 +47,8 @@ does, on approval. Do not summarize; the operator acts on the specific rows.
    exact failed command and its exit status.
    Each command still triggers the host's normal permission prompt; the word "approve" is textual
    consent, not a bypass.
-6. Re-run `--plan-only < /dev/null` once. Still paused → report and stop. Never loop. Otherwise
-   the normal plan now prints — continue with section B.
+6. Re-run `--plan-only --host codex < /dev/null` once. Still paused → report and stop. Never
+   loop. Otherwise the normal plan now prints — continue with section B.
 
 Windows-only: if the launcher itself cannot start (bash or python missing), run these natively in
 cmd.exe, then return to step 1:
@@ -75,7 +75,7 @@ start /wait "" "%TEMP%\chinamaxM-miniconda.exe" /InstallationType=JustMe /Regist
 8. Only after the operator approves, apply with the digest from step 1 — append `--probes` only
    if they opted into probes:
 
-   `"<plugin-checkout>/scripts/chinamaxM" setup --apply --plan-digest <digest> < /dev/null`
+   `"<plugin-checkout>/scripts/chinamaxM" setup --apply --plan-digest <digest> --host codex < /dev/null`
 
    Apply re-checks the plan digest and preconditions and ABORTS without mutating if anything
    drifted since step 1. Show the operator the full report verbatim — do not summarize away
@@ -86,10 +86,14 @@ agents are picked up.
 
 ## Teardown
 
-Removes ONLY the env flip and the service; keys, agents, and Linux linger are left in place:
+Host-scoped: removes OUR generated `model_providers.chinamaxM-*` entries from
+`~/.codex/config.toml`, the shared Proxy service, and the recorded interpreter; keys, agents,
+and Linux linger are left in place. The Proxy service is SHARED — if Claude was also wired,
+tearing down here removes its Proxy too, and the report says so (run teardown inside Claude to
+remove its env flip).
 
-`"<plugin-checkout>/scripts/chinamaxM" setup --teardown < /dev/null`  (renders plan + digest)
-`"<plugin-checkout>/scripts/chinamaxM" setup --teardown --plan-digest <digest> < /dev/null`  (applies)
+`"<plugin-checkout>/scripts/chinamaxM" setup --teardown --host codex < /dev/null`  (renders plan + digest)
+`"<plugin-checkout>/scripts/chinamaxM" setup --teardown --plan-digest <digest> --host codex < /dev/null`  (applies)
 
 ## Notes
 

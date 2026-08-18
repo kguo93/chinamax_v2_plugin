@@ -20,6 +20,7 @@ that check's level rather than crashing the engine or leaking file content.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -30,7 +31,13 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
-from chinamaxM.keyfiles import KEY_FILE_NAME, KeyFileReader, resolve_host_root
+from chinamaxM.keyfiles import (
+    KEY_FILE_NAME,
+    HostResolutionError,
+    KeyFileReader,
+    resolve_host,
+    resolve_host_root,
+)
 from chinamaxM.registry import Registry, RegistryError, load_registry
 
 #: The banned URL fragment: a chat-completions WIRE path (never a litellm symbol name,
@@ -227,6 +234,7 @@ def _package_tree() -> Path | None:
 class DoctorContext:
     """The once-resolved inputs shared by every check (the Registry loads exactly once)."""
 
+    host: str
     claude_root: Path
     codex_root: Path
     registry: Registry | None
@@ -382,44 +390,36 @@ def _check_flip_target(value: str, port: int) -> Finding:
 
 
 def check_drift(ctx: DoctorContext) -> list[Finding]:
-    """FAIL: generated agents in sync with the Registry on both Hosts (model line excepted).
+    """FAIL: the invoking Host's generated agents are in sync with the Registry (model line
+    excepted).
 
-    The dispatch-mutable model line is excluded from staleness and surfaced as info under
-    ``model_lines`` (ADR 0004 as amended). Codex-side drift is skipped when the resolved
-    Codex root is absent (a Claude-only machine has no Codex artifacts to compare)."""
+    Host-scoped (ADR 0005 as amended 2026-08-18): a Claude doctor compares only the Claude
+    agents, a Codex doctor only the Codex role TOMLs + provider tables — the other Host never
+    appears. The dispatch-mutable model line is excluded from staleness and surfaced as info
+    under ``model_lines`` (ADR 0004 as amended)."""
     if ctx.registry is None:
         return [Finding("drift", "fail", "skipped", _REGISTRY_UNREADABLE)]
     from chinamaxM.generate import detect_drift
 
-    result = detect_drift(ctx.registry, {"claude": ctx.claude_root, "codex": ctx.codex_root})
-    claude_issues: dict[str, list[str]] = {}
-    codex_issues: dict[str, list[str]] = {}
-    for bucket in ("missing", "stale", "foreign", "conflicts"):
-        for item in result[bucket]:
-            target = codex_issues if _is_codex_item(item, ctx.codex_root) else claude_issues
-            target.setdefault(bucket, []).append(item)
+    result = detect_drift(ctx.registry, {"claude": ctx.claude_root, "codex": ctx.codex_root}, ctx.host)
+    issues = {
+        bucket: result[bucket]
+        for bucket in ("missing", "stale", "foreign", "conflicts")
+        if result[bucket]
+    }
+    fid = f"drift-{ctx.host}"
+    noun = "agents" if ctx.host == "claude" else "artifacts"
+    label = "Claude" if ctx.host == "claude" else "Codex"
 
     findings: list[Finding] = []
-    if claude_issues:
-        findings.append(Finding("drift-claude", "fail", "fail", f"Claude agents out of sync ({_summarize(claude_issues)})"))
+    if issues:
+        findings.append(Finding(fid, "fail", "fail", f"{label} {noun} out of sync ({_summarize(issues)})"))
     else:
-        findings.append(Finding("drift-claude", "fail", "ok", "Claude generated agents in sync"))
-
-    if not ctx.codex_root.exists():
-        findings.append(Finding("drift-codex", "fail", "skipped", f"codex root {ctx.codex_root} absent"))
-    elif codex_issues:
-        findings.append(Finding("drift-codex", "fail", "fail", f"Codex artifacts out of sync ({_summarize(codex_issues)})"))
-    else:
-        findings.append(Finding("drift-codex", "fail", "ok", "Codex generated artifacts in sync"))
+        findings.append(Finding(fid, "fail", "ok", f"{label} generated {noun} in sync"))
 
     for path, model in sorted(result["model_lines"].items()):
         findings.append(Finding("drift-model", "info", "ok", f"{Path(path).name}: model = {model}"))
     return findings
-
-
-def _is_codex_item(item: str, codex_root: Path) -> bool:
-    """Return whether a drift item names a Codex-side artifact (path or provider table)."""
-    return item.startswith("model_providers.") or str(codex_root) in item
 
 
 def _summarize(issues: dict[str, list[str]]) -> str:
@@ -445,35 +445,36 @@ def check_strict_config(ctx: DoctorContext) -> list[Finding]:
 
 
 def check_keys(ctx: DoctorContext) -> list[Finding]:
-    """WARN: each Profile's key PRESENT/MISSING per Host Key file (never a value)."""
+    """WARN: each Profile's key PRESENT/MISSING in the invoking Host's Key file (never a value).
+
+    Host-scoped (ADR 0005/0006 as amended 2026-08-18): only the invoking Host's
+    ``model-keys.env`` is opened for variable NAMES and presence — the other Host's file is
+    never read."""
     if ctx.registry is None:
         return [Finding("keys", "warn", "skipped", _REGISTRY_UNREADABLE)]
+    host = ctx.host
+    root = ctx.claude_root if host == "claude" else ctx.codex_root
+    key_path = Path(root) / KEY_FILE_NAME
+    try:  # stat first: the reader maps both absent and unreadable to an empty mapping
+        key_path.stat()
+        file_state = "present"
+    except FileNotFoundError:
+        file_state = "absent"
+    except OSError:
+        file_state = "unreadable"
+    reader = KeyFileReader(key_path) if file_state == "present" else None
     findings: list[Finding] = []
-    hosts = [("claude", ctx.claude_root, True), ("codex", ctx.codex_root, ctx.codex_root.exists())]
-    for host, root, present in hosts:
-        if not present:
-            findings.append(Finding(f"keys-{host}", "warn", "skipped", f"codex root {ctx.codex_root} absent"))
-            continue
-        key_path = Path(root) / KEY_FILE_NAME
-        try:  # stat first: the reader maps both absent and unreadable to an empty mapping
-            key_path.stat()
-            file_state = "present"
-        except FileNotFoundError:
-            file_state = "absent"
-        except OSError:
-            file_state = "unreadable"
-        reader = KeyFileReader(key_path) if file_state == "present" else None
-        for profile in ctx.registry.profiles.values():
-            var = profile.api_key_env
-            fid = f"key-{host}-{profile.name}"
-            if file_state == "absent":
-                findings.append(Finding(fid, "warn", "warn", f"{var} MISSING ({host} key file absent)"))
-            elif file_state == "unreadable":
-                findings.append(Finding(fid, "warn", "warn", f"{var} unknown ({host} key file unreadable)"))
-            else:
-                has_value = bool(reader.get(var))  # only the boolean is used — never the value
-                state = "PRESENT" if has_value else "MISSING"
-                findings.append(Finding(fid, "warn", "ok" if has_value else "warn", f"{var} {state} ({host} key file)"))
+    for profile in ctx.registry.profiles.values():
+        var = profile.api_key_env
+        fid = f"key-{host}-{profile.name}"
+        if file_state == "absent":
+            findings.append(Finding(fid, "warn", "warn", f"{var} MISSING ({host} key file absent)"))
+        elif file_state == "unreadable":
+            findings.append(Finding(fid, "warn", "warn", f"{var} unknown ({host} key file unreadable)"))
+        else:
+            has_value = bool(reader.get(var))  # only the boolean is used — never the value
+            state = "PRESENT" if has_value else "MISSING"
+            findings.append(Finding(fid, "warn", "ok" if has_value else "warn", f"{var} {state} ({host} key file)"))
     return findings
 
 
@@ -573,30 +574,34 @@ def check_linger(ctx: DoctorContext) -> list[Finding]:
 
 # --------------------------------------------------------------------------- engine
 
-#: The roster: ``(id, level, category_phrase, function)`` in report order. ``category_phrase``
-#: is used only to build the content-free detail of an unexpected ``error`` Finding.
-_CHECKS: list[tuple[str, str, str, Callable[[DoctorContext], list[Finding]]]] = [
-    ("registry", "fail", "registry parse/merge", check_registry),
-    ("conda", "fail", "conda env probe", check_conda),
-    ("service", "fail", "service status", check_service),
-    ("port", "fail", "proxy port probe", check_port),
-    ("env-flip", "fail", "settings env-flip read", check_env_flip),
-    ("drift", "fail", "generated-agent drift", check_drift),
-    ("codex-strict-config", "fail", "codex strict-config", check_strict_config),
-    ("keys", "warn", "key-file roster", check_keys),
-    ("subagent-model", "warn", "CLAUDE_CODE_SUBAGENT_MODEL", check_subagent_model),
-    ("kimi-responses-bug", "warn", "kimi Responses scan", check_kimi),
-    ("codex-version", "warn", "codex CLI version", check_codex_version),
-    ("log-path", "info", "request-log path", check_log_path),
-    ("linger", "info", "linger state", check_linger),
+#: The roster: ``(id, level, category_phrase, scope, function)`` in report order.
+#: ``category_phrase`` builds the content-free detail of an unexpected ``error`` Finding.
+#: ``scope`` is the Host filter (ADR 0005 as amended 2026-08-18): ``"shared"`` checks run on
+#: either Host (the two host-branching checks — drift and keys — are ``"shared"`` and scope
+#: their OWN findings to ``ctx.host``); ``"claude"`` / ``"codex"`` checks run ONLY on that
+#: Host, so the other Host's wiring never appears in the report.
+_CHECKS: list[tuple[str, str, str, str, Callable[[DoctorContext], list[Finding]]]] = [
+    ("registry", "fail", "registry parse/merge", "shared", check_registry),
+    ("conda", "fail", "conda env probe", "shared", check_conda),
+    ("service", "fail", "service status", "shared", check_service),
+    ("port", "fail", "proxy port probe", "shared", check_port),
+    ("env-flip", "fail", "settings env-flip read", "claude", check_env_flip),
+    ("drift", "fail", "generated-agent drift", "shared", check_drift),
+    ("codex-strict-config", "fail", "codex strict-config", "codex", check_strict_config),
+    ("keys", "warn", "key-file roster", "shared", check_keys),
+    ("subagent-model", "warn", "CLAUDE_CODE_SUBAGENT_MODEL", "claude", check_subagent_model),
+    ("kimi-responses-bug", "warn", "kimi Responses scan", "shared", check_kimi),
+    ("codex-version", "warn", "codex CLI version", "codex", check_codex_version),
+    ("log-path", "info", "request-log path", "shared", check_log_path),
+    ("linger", "info", "linger state", "shared", check_linger),
 ]
 
 
 def _run_check(
-    check: tuple[str, str, str, Callable[[DoctorContext], list[Finding]]], ctx: DoctorContext
+    check: tuple[str, str, str, str, Callable[[DoctorContext], list[Finding]]], ctx: DoctorContext
 ) -> list[Finding]:
     """Run one check with isolation: an unexpected exception yields a content-free error."""
-    check_id, level, phrase, func = check
+    check_id, level, phrase, _scope, func = check
     try:
         return func(ctx)
     except Exception as exc:  # noqa: BLE001 - never crash the engine, never leak content
@@ -613,6 +618,7 @@ def _exit_code(findings: list[Finding]) -> int:
 
 def run_doctor(
     *,
+    host: str,
     claude_root: str | os.PathLike[str] | None = None,
     codex_root: str | os.PathLike[str] | None = None,
     overlay_path: str | os.PathLike[str] | None = None,
@@ -621,12 +627,15 @@ def run_doctor(
     service_status: Callable[[object], object] | None = None,
     scan_tree: str | os.PathLike[str] | None = None,
 ) -> tuple[list[Finding], int]:
-    """Run the full roster once and return ``(findings, exit_code)``.
+    """Run the invoking Host's roster once and return ``(findings, exit_code)``.
 
-    The Registry loads exactly once (via the canonical Overlay path under the resolved Claude
-    root) and is passed to every check; a Registry failure makes registry-dependent checks
-    report ``skipped (registry unreadable)`` while the env-flip PRESENCE sub-finding still
-    reports. Every runner/probe/tree is injectable so tests drive each state hermetically.
+    Host-scoped (ADR 0005 as amended 2026-08-18): shared-infrastructure checks always run;
+    the invoking Host's wiring checks run; the other Host's checks are skipped entirely, so
+    its wiring never appears. The Registry loads exactly once (via the canonical Overlay path
+    under the resolved Claude root) and is passed to every check; a Registry failure makes
+    registry-dependent checks report ``skipped (registry unreadable)`` while the env-flip
+    PRESENCE sub-finding still reports. Every runner/probe/tree is injectable so tests drive
+    each state hermetically.
     """
     claude = Path(claude_root) if claude_root is not None else resolve_host_root("claude")
     codex = Path(codex_root) if codex_root is not None else resolve_host_root("codex")
@@ -649,9 +658,12 @@ def run_doctor(
         registry = None
         registry_error = f"registry could not be loaded ({type(exc).__name__})"
 
-    ctx = DoctorContext(claude, codex, registry, registry_error, run, port_probe, service_status, tree)
+    ctx = DoctorContext(host, claude, codex, registry, registry_error, run, port_probe, service_status, tree)
     findings: list[Finding] = []
     for check in _CHECKS:
+        scope = check[3]
+        if scope != "shared" and scope != host:
+            continue
         findings.extend(_run_check(check, ctx))
     return findings, _exit_code(findings)
 
@@ -681,20 +693,23 @@ def _key_present(root: Path, var: str) -> bool:
 
 def render_profiles(
     *,
+    host: str,
     claude_root: str | os.PathLike[str] | None = None,
     codex_root: str | os.PathLike[str] | None = None,
     overlay_path: str | os.PathLike[str] | None = None,
 ) -> tuple[str, int]:
-    """Render the resolved Profiles roster; never print a key value (ADR 0006).
+    """Render the resolved Profiles roster for the invoking Host; never print a key value.
 
-    Lists each Profile's ``default_model`` (plus the current model line when a generated
-    Claude agent's differs — the dispatch-mutable info), ``dialect``, key variable name, and
-    PRESENT/MISSING per Host file (the Codex column shows the resolved-root skip detail when
-    the Codex root is absent). An unreadable Registry prints one error line and exits nonzero.
+    Host-scoped (ADR 0005/0006 as amended 2026-08-18): each Profile lists ``default_model``
+    (plus the current model line when the invoking Host's generated artifact differs — the
+    dispatch-mutable info), ``dialect``, key variable name, and PRESENT/MISSING for the
+    invoking Host's Key file ONLY — the other Host's file never appears. An unreadable
+    Registry prints one error line and exits nonzero.
     """
     claude = Path(claude_root) if claude_root is not None else resolve_host_root("claude")
     codex = Path(codex_root) if codex_root is not None else resolve_host_root("codex")
     overlay = Path(overlay_path) if overlay_path is not None else claude / "chinamaxM" / "profiles.json"
+    root = claude if host == "claude" else codex
 
     try:
         registry = load_registry(overlay_path=overlay)
@@ -703,30 +718,26 @@ def render_profiles(
     except Exception as exc:  # noqa: BLE001
         return f"chinamaxM profiles: registry unreadable ({type(exc).__name__})\n", 1
 
-    codex_present = codex.exists()
     from chinamaxM.generate import detect_drift
 
     try:
-        model_lines = detect_drift(registry, {"claude": claude, "codex": codex})["model_lines"]
+        model_lines = detect_drift(registry, {"claude": claude, "codex": codex}, host)["model_lines"]
     except Exception:  # noqa: BLE001 - /profiles renders even if drift inspection stumbles
         model_lines = {}
 
+    suffix = "md" if host == "claude" else "toml"
     lines = ["chinamaxM profiles", ""]
     for profile in registry.profiles.values():
         lines.append(profile.name)
         lines.append(f"  default model: {profile.default_model}")
-        raw = model_lines.get(str(claude / "agents" / f"{profile.name}.md"))
+        raw = model_lines.get(str(root / "agents" / f"{profile.name}.{suffix}"))
         if isinstance(raw, str) and raw:
-            bare = raw.split("/", 1)[1] if "/" in raw else raw
+            bare = raw.split("/", 1)[1] if (host == "claude" and "/" in raw) else raw
             if bare != profile.default_model:
                 lines.append(f"  current model: {bare}")
         lines.append(f"  dialect: {profile.dialect}")
         lines.append(f"  key variable: {profile.api_key_env}")
-        lines.append(f"    claude key: {'PRESENT' if _key_present(claude, profile.api_key_env) else 'MISSING'}")
-        if codex_present:
-            lines.append(f"    codex key: {'PRESENT' if _key_present(codex, profile.api_key_env) else 'MISSING'}")
-        else:
-            lines.append(f"    codex key: skipped (codex root {codex} absent)")
+        lines.append(f"    {host} key: {'PRESENT' if _key_present(root, profile.api_key_env) else 'MISSING'}")
         lines.append("")
     return "\n".join(lines) + "\n", 0
 
@@ -735,13 +746,31 @@ def render_profiles(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the roster, or render ``--profiles``; return the process exit code."""
-    args = list(sys.argv[1:] if argv is None else argv)
-    if "--profiles" in args:
-        text, code = render_profiles()
+    """Run the invoking Host's roster, or render ``--profiles``; return the process exit code.
+
+    The Host is resolved by the shared ladder (ADR 0005 as amended 2026-08-18): ``--host``
+    → ``CHINAMAXM_HOST`` → plugin env evidence → a hard error (stderr + exit 2).
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m chinamaxM.doctor",
+        description="chinamaxM read-only diagnosis (Host-scoped).",
+    )
+    parser.add_argument("--profiles", action="store_true", help="render the Profiles roster instead")
+    parser.add_argument(
+        "--host", default=None,
+        help="claude or codex; defaults to the CHINAMAXM_HOST marker / plugin env evidence",
+    )
+    args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    try:
+        host = resolve_host(args.host)
+    except HostResolutionError as exc:
+        sys.stderr.write(str(exc) + "\n")
+        return 2
+    if args.profiles:
+        text, code = render_profiles(host=host)
         sys.stdout.write(text)
         return code
-    findings, code = run_doctor()
+    findings, code = run_doctor(host=host)
     sys.stdout.write(render_report(findings))
     return code
 

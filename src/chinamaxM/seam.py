@@ -400,10 +400,18 @@ def _build_messages(items: list) -> list[dict]:
     assistant-side message. call_ids are validated for strict pairing before anything
     reaches the provider.
 
+    An item with no ``type`` is read as a ``message``, matching the Responses API, where
+    ``type`` is optional on an input message and every other item type carries it.
+
+    A call run's outputs are hoisted ahead of anything a Host interleaved between them
+    (``_hoist_run_outputs``) before grouping, so the grouped results are always the one
+    message immediately after their ``tool_use`` turn — the adjacency Anthropic enforces.
+
     Raises:
         SeamError: 400 on an unknown item type, an unsupported role, or a broken call_id
             pairing; 500 if an isolated transform does not yield exactly one message.
     """
+    items = list(items)  # hoisting reorders in place; never mutate the caller's list
     messages: list[dict] = []
     pending_thinking: list[dict] = []
     seen_call_ids: set[str] = set()
@@ -415,7 +423,7 @@ def _build_messages(items: list) -> list[dict]:
         item = items[index]
         if not isinstance(item, dict):
             raise SeamError(400, "each input item must be an object", "invalid_request_error")
-        itype = item.get("type")
+        itype = item.get("type") or "message"  # optional on an input message item
 
         if itype == "message" and item.get("role") in _SYSTEM_ROLES:
             index += 1  # already folded into the top-level system
@@ -443,6 +451,7 @@ def _build_messages(items: list) -> list[dict]:
                 message["content"] = pending_thinking + list(message.get("content", []))
                 pending_thinking = []
             messages.append(message)
+            _hoist_run_outputs(items, end, {items[i]["call_id"] for i in range(index, end)})
             index = end
         elif itype == "function_call_output":
             end = _scan_function_call_output_run(
@@ -502,6 +511,34 @@ def _scan_function_call_output_run(
         used_output_ids.add(call_id)
         index += 1
     return index
+
+
+def _hoist_run_outputs(items: list, start: int, run_ids: set[str]) -> None:
+    """Reorder a call run's outputs ahead of items interleaved between them (in place).
+
+    Hosts inject messages between a parallel call run's outputs (a Codex PreToolUse
+    hook's additionalContext lands as a developer message there), which would split the
+    output run — but Anthropic requires every ``tool_use`` of an assistant turn to be
+    answered in the immediately-following user message. Hoisting keeps the output run
+    contiguous; the interleaved items keep their relative order after it.
+    """
+    outputs: list = []
+    rest: list = []
+    index = start
+    count = len(items)
+    while index < count and len(outputs) < len(run_ids):
+        item = items[index]
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and item.get("call_id") in run_ids
+        ):
+            outputs.append(item)
+        else:
+            rest.append(item)
+        index += 1
+    if outputs and rest:
+        items[start:index] = outputs + rest
 
 
 def _reasoning_item_to_block(item: dict) -> dict | None:

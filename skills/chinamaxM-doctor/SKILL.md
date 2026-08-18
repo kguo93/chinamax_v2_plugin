@@ -11,12 +11,12 @@ Anthropic-surfaces-only.
 
 Run this and show the operator its complete output:
 
-`"<plugin-checkout>/scripts/chinamaxM" doctor`
+`"<plugin-checkout>/scripts/chinamaxM" doctor --host codex`
 
 For a headless run, close stdin by appending `< /dev/null` (`codex exec` blocks on an open
 pipeline stdin):
 
-`"<plugin-checkout>/scripts/chinamaxM" doctor < /dev/null`
+`"<plugin-checkout>/scripts/chinamaxM" doctor --host codex < /dev/null`
 
 The doctor exits nonzero when at least one FAIL-level check failed; WARN-only and info
 findings exit zero. Report the findings as-is — do not summarize away FAIL lines.

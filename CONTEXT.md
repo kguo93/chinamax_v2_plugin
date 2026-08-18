@@ -82,15 +82,15 @@ _Avoid_: progress message, status update, "worker X says"
 A mid-run instruction to a Worker. On Claude, a direct message to the named subagent; on Codex, parent-mediated (`send_input`) because the platform rejects direct operator→child input. The user-facing surface is symmetric; the mediation is a Host-specific workaround.
 
 **Host**:
-The plugin host a request or artifact belongs to — `claude` or `codex`. Determines ingress, Key file, and generated-artifact format; it is never a provider Profile.
+The plugin host a request or artifact belongs to — `claude` or `codex`. Determines ingress, Key file, and generated-artifact format; it is never a provider Profile. Every command surface resolves the invoking Host once, by ladder — explicit `--host`, else the `CHINAMAXM_HOST` marker, else plugin-environment evidence with Codex evidence outranking Claude's (Codex exposes Claude-compatible aliases) — and errors rather than guesses when nothing resolves; the warn-only SessionStart hook instead stays silent.
 
 ### Operations
 
 **Doctor**:
-The pure-diagnosis command: free, local, token-less, mutation-less. Probes only Anthropic-surface endpoints; warns without exiting on upstream gaps (the kimi-k3 Responses bug), fails only on broken installation state.
+The pure-diagnosis command: free, local, token-less, mutation-less. Probes only Anthropic-surface endpoints; warns without exiting on upstream gaps (the kimi-k3 Responses bug), fails only on broken installation state. Host-scoped: it reports the shared infrastructure plus the invoking Host's wiring only; the other Host never appears in its report.
 
 **Setup**:
-The consent-gated mutating command: diagnose → plan → approve → apply → re-diagnose → report. The only place live paid probes run, opt-in at the consent pause.
+The consent-gated mutating command: diagnose → plan → approve → apply → re-diagnose → report. The only place live paid probes run, opt-in at the consent pause. Host-scoped: it converges the shared Proxy infrastructure idempotently, then installs ONLY the invoking Host's wiring — the other Host's artifacts are never touched, so a dual-Host machine runs Setup once inside each Host.
 
 **Prerequisite**:
 An external Platform tool setup must have before it can build the `chinamaxM` conda env the Proxy runs in — `bash`, Git for Windows' `git`/`bash`/`cygpath` (Windows), Miniconda's `conda` — detected per Platform at the start of setup, before any conda-env / dependency / Key-file / service mutation (the plan's read-only diagnose still runs). Distinct from the Python dependencies installed inside the env. A missing Prerequisite PAUSES setup (Phase A) for operator approval; it is never installed silently, and the setup engine never runs an installer itself. On Windows a Prerequisite means Git for Windows' own tooling specifically — Git Bash is resolved from the Git-for-Windows install tree, never a PATH bash (which may be WSL's, not the bash the Codex hooks run).

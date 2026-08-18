@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from chinamaxM import doctor, settings_json
+from chinamaxM.keyfiles import HostResolutionError, resolve_host
 from chinamaxM.ops.supervision import SupervisionStatus
 from chinamaxM.setup import (
     _GIT_FOR_WINDOWS_URL,
@@ -133,16 +134,20 @@ class RecordingRun:
 
     ``fail_on`` is an optional predicate over the argv list; when it returns True the call
     reports a non-zero returncode (so stop-on-first-failure paths can be exercised).
+    ``stderr_on`` is an optional argv -> str callable supplying that call's stderr, so a
+    tool that reports WHY it failed (codex strict-config) can be reproduced faithfully.
     """
 
-    def __init__(self, fail_on=None):
+    def __init__(self, fail_on=None, stderr_on=None):
         self.calls: list[dict] = []
         self._fail_on = fail_on
+        self._stderr_on = stderr_on
 
     def __call__(self, argv, *, timeout, env=None):
         self.calls.append({"argv": list(argv), "timeout": timeout, "env": env})
         rc = 1 if (self._fail_on is not None and self._fail_on(list(argv))) else 0
-        return subprocess.CompletedProcess(argv, rc, "", "")
+        stderr = self._stderr_on(list(argv)) if self._stderr_on is not None else ""
+        return subprocess.CompletedProcess(argv, rc, "", stderr)
 
 
 def _healthy_findings():
@@ -160,7 +165,13 @@ def _clock(step=5.0):
 
 
 def make_engine(tmp_path, **overrides):
-    """Build a SetupEngine over temp roots with fully faked seams."""
+    """Build a SetupEngine over temp roots with fully faked seams.
+
+    ``host`` defaults to ``"claude"`` (the invoking Host the engine acts for). Every test
+    passes it explicitly through this helper; the engine is Host-scoped (ADR 0005 as amended
+    2026-08-18), so a Claude engine installs only Claude wiring and a Codex engine only Codex.
+    """
+    host = overrides.pop("host", "claude")
     claude = tmp_path / "claude"
     claude.mkdir(parents=True, exist_ok=True)
     codex = tmp_path / "codex"
@@ -189,6 +200,7 @@ def make_engine(tmp_path, **overrides):
         prerequisites = lambda snapshot=dict(present): dict(snapshot)
 
     engine = SetupEngine(
+        host=host,
         claude_root=str(claude),
         codex_root=str(codex),
         plugin_root=str(tmp_path / "plugin"),
@@ -196,7 +208,7 @@ def make_engine(tmp_path, **overrides):
         conda=conda,
         diagnose=diagnose,
         prerequisites=prerequisites,
-        generate_fn=lambda reg, roots, inc: _run_generation(reg, roots, include_codex=inc),
+        generate_fn=lambda reg, roots, host: _run_generation(reg, roots, host=host),
         service_status=service.status,
         service_install=service.install,
         service_update=service.update,
@@ -277,15 +289,15 @@ def test_apply_steps_against_temp_roots(tmp_path):
     # conda create + pip recorded (create because the fixture env is absent).
     assert ctx["conda"].created == 1 and ctx["conda"].pip_calls
 
-    # Both Key files scaffolded (Codex present).
+    # Claude host scaffolds ONLY the Claude Key file (host-scoped — ADR 0006 as amended).
     assert (tmp_path / "claude" / "model-keys.env").exists()
-    assert (tmp_path / "codex" / "model-keys.env").exists()
+    assert not (tmp_path / "codex" / "model-keys.env").exists()
 
-    # Generation produced the full artifact set (Claude agents + Codex roles + config).
+    # Generation produced ONLY the Claude agents; no Codex artifacts on a Claude-host run.
     for name in SEED_PROFILES:
         assert (tmp_path / "claude" / "agents" / f"{name}.md").exists()
-        assert (tmp_path / "codex" / "agents" / f"{name}.toml").exists()
-    assert (tmp_path / "codex" / "config.toml").exists()
+        assert not (tmp_path / "codex" / "agents" / f"{name}.toml").exists()
+    assert not (tmp_path / "codex" / "config.toml").exists()
 
     # Service install() called once; enable-linger recorded on Linux.
     assert ctx["service"].installs == 1 and ctx["service"].updates == 0
@@ -340,6 +352,10 @@ def test_probes_minimal_and_reported(tmp_path):
     for req in responses:
         assert req["body"]["max_output_tokens"] == 1
         assert "/" not in req["body"]["model"]  # Responses carries the BARE default model
+        # The probe speaks Codex's own wire shape, so it exercises the real Seam path.
+        assert req["body"]["input"] == [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}
+        ]
 
     verdicts = {(p.profile, p.ingress): p.ok for p in report.probe_results}
     assert verdicts[("deepseek", "responses")] is False  # the scripted failure
@@ -347,21 +363,104 @@ def test_probes_minimal_and_reported(tmp_path):
     assert any(p.usage for p in report.probe_results if p.ok)
 
 
-def test_claude_only_generation_without_codex_home(tmp_path):
-    """AC-4 + Claude-only branch: no Responses probes, six agents written, ~/.codex never made."""
-    engine, ctx = make_engine(tmp_path, codex=False)
+def test_claude_host_scoped_generation_and_probes(tmp_path):
+    """Host-scoped: a Claude-host setup writes ONLY Claude agents and never fabricates ~/.codex,
+    while probes still hit BOTH ingresses (probes are not Host-scoped — ADR 0005 as amended)."""
+    engine, ctx = make_engine(tmp_path, codex=False)  # host defaults to claude; no codex home
     plan = engine.build_plan()
+
+    # A Claude-host plan carries no Codex steps, even though (here) there is no Codex home.
+    ids = [s.id for s in plan.steps]
+    assert "scaffold-claude-key" in ids and "scaffold-codex-key" not in ids
+    assert "codex-validate" not in ids
+    assert "env-flip" in ids  # the Claude flip IS present
+
     report = engine.apply(plan.digest, probes=True)
     assert report.exit_code == 0, render_report(report)
 
-    # Zero Responses-ingress probes; one Anthropic probe per Profile.
-    assert all("/responses" not in r["url"] for r in ctx["http"].requests)
+    # Probes hit BOTH ingresses per Profile even with no Codex home (ungated).
     assert len([r for r in ctx["http"].requests if r["url"].endswith("/v1/messages")]) == len(SEED_PROFILES)
+    assert len([r for r in ctx["http"].requests if "/responses" in r["url"]]) == len(SEED_PROFILES)
 
-    # The Claude-only branch WROTE the six agent files and fabricated NO Codex artifacts.
+    # Only the six Claude agents written; the Codex home is never fabricated (ADR 0006).
     for name in SEED_PROFILES:
         assert (tmp_path / "claude" / "agents" / f"{name}.md").exists()
-    assert not (tmp_path / "codex").exists()  # the Codex home is never fabricated (ADR 0006)
+    assert not (tmp_path / "codex").exists()
+
+
+def test_codex_host_scoped_generation(tmp_path):
+    """Host-scoped: a Codex-host setup scaffolds the Codex key + generates Codex artifacts +
+    validates strict-config, with NO Claude scaffold, NO Claude agents, and NO env flip."""
+    engine, ctx = make_engine(tmp_path, host="codex")
+    plan = engine.build_plan()
+    ids = [s.id for s in plan.steps]
+    assert "scaffold-codex-key" in ids and "scaffold-claude-key" not in ids
+    assert "codex-validate" in ids
+    assert "env-flip" not in ids  # Codex rides its provider entries — no settings.json flip
+
+    report = engine.apply(plan.digest)
+    assert report.exit_code == 0, render_report(report)
+
+    # Only the Codex Key file scaffolded; the Claude file is never touched.
+    assert (tmp_path / "codex" / "model-keys.env").exists()
+    assert not (tmp_path / "claude" / "model-keys.env").exists()
+
+    # Codex artifacts written; no Claude agents; no env flip on disk.
+    for name in SEED_PROFILES:
+        assert (tmp_path / "codex" / "agents" / f"{name}.toml").exists()
+        assert not (tmp_path / "claude" / "agents" / f"{name}.md").exists()
+    assert (tmp_path / "codex" / "config.toml").exists()
+    assert not (tmp_path / "claude" / "settings.json").exists()
+
+
+def _is_codex_validate(argv):
+    return argv[:2] == ["codex", "exec"]
+
+
+def test_codex_validate_accepts_the_promptless_exit(tmp_path):
+    """A promptless ``codex exec`` exits non-zero AFTER a clean strict parse — not a failure.
+
+    Real Codex (0.147.0) reads the prompt from stdin, which setup closes; config is loaded
+    first, so this exit means the config validated. Setup must continue to the service and
+    env-flip steps instead of aborting them.
+    """
+    run = RecordingRun(
+        fail_on=_is_codex_validate,
+        stderr_on=lambda argv: (
+            "Reading prompt from stdin...\nNo prompt provided via stdin.\n"
+            if _is_codex_validate(argv) else ""
+        ),
+    )
+    engine, ctx = make_engine(tmp_path, host="codex", run=run)
+    report = engine.apply(engine.build_plan().digest)
+
+    outcomes = {r.id: r.status for r in report.step_results}
+    assert outcomes["codex-validate"] == "ok"
+    assert report.exit_code == 0, render_report(report)
+    # The service step that used to be aborted by the false failure now runs (no env flip on Codex).
+    assert outcomes["service"] == "ok"
+    assert "env-flip" not in outcomes
+
+
+def test_codex_validate_still_fails_on_a_rejected_config(tmp_path):
+    """A genuine strict-config rejection fails the step and carries Codex's own report."""
+    rejection = (
+        "Error loading config.toml:\n"
+        "/home/u/.codex/config.toml:1:1: unknown configuration field `nope`\n"
+    )
+    run = RecordingRun(
+        fail_on=_is_codex_validate,
+        stderr_on=lambda argv: rejection if _is_codex_validate(argv) else "",
+    )
+    engine, ctx = make_engine(tmp_path, host="codex", run=run)
+    report = engine.apply(engine.build_plan().digest)
+
+    outcomes = {r.id: r.status for r in report.step_results}
+    assert outcomes["codex-validate"] == "failed"
+    assert report.exit_code == 1
+    # codex-validate precedes the service step, so its failure aborts the rest.
+    assert outcomes["service"] == "aborted"
+    assert "unknown configuration field" in render_report(report)  # the WHY is surfaced
 
 
 def test_teardown_exact(tmp_path):
@@ -519,8 +618,8 @@ def test_plan_only_cli_is_read_only(tmp_path, monkeypatch, capsys):
     from chinamaxM import setup as setup_mod
 
     engine, _ctx = make_engine(tmp_path)
-    monkeypatch.setattr(setup_mod, "SetupEngine", lambda: engine)
-    code = setup_mod.main(["--plan-only"])
+    monkeypatch.setattr(setup_mod, "SetupEngine", lambda **_kwargs: engine)
+    code = setup_mod.main(["--plan-only", "--host", "claude"])
     out = capsys.readouterr().out
     assert code == 0
     assert "Plan digest:" in out
@@ -568,9 +667,9 @@ class _Art:
 claude = tempfile.mkdtemp()
 codex = tempfile.mkdtemp()
 engine = setup.SetupEngine(
-    claude_root=claude, codex_root=codex, plugin_root=claude,
+    host="claude", claude_root=claude, codex_root=codex, plugin_root=claude,
     run=lambda *a, **k: None, conda=_Conda(), diagnose=lambda: [],
-    generate_fn=lambda reg, roots, inc: {}, service_status=lambda cfg: _Status(),
+    generate_fn=lambda reg, roots, host: {}, service_status=lambda cfg: _Status(),
     service_install=lambda cfg: None, service_update=lambda cfg: None,
     service_teardown=lambda cfg: None,
     service_render=lambda cfg: _Art(claude + "/unit.service"),
@@ -760,6 +859,136 @@ def test_records_and_removes_python_path(tmp_path):
     report_td2 = engine.teardown(engine.build_teardown_plan().digest)
     assert report_td2.exit_code == 0
     assert {r.id: r.status for r in report_td2.step_results}["python-path-remove"] == "ok"
+
+
+# ------------------------------------------------- Host-resolution ladder + host-scoped CLI/teardown
+#
+# The shared resolver (ADR 0005 as amended 2026-08-18): explicit --host → CHINAMAXM_HOST →
+# Codex plugin evidence → Claude plugin evidence → hard error. Codex evidence outranks Claude's.
+
+
+def test_resolve_host_ladder():
+    """First match wins; explicit beats marker beats evidence; Codex evidence beats Claude's."""
+    # Explicit wins over a conflicting marker AND conflicting evidence; case-insensitive/stripped.
+    env = {"CHINAMAXM_HOST": "codex", "CLAUDE_PLUGIN_ROOT": "/c"}
+    assert resolve_host("claude", env) == "claude"
+    assert resolve_host("  CODEX  ", env) == "codex"
+
+    # Marker beats evidence.
+    assert resolve_host(None, {"CHINAMAXM_HOST": "claude", "PLUGIN_ROOT": "/p"}) == "claude"
+
+    # Codex evidence outranks Claude evidence (Codex exposes Claude-compatible aliases).
+    assert resolve_host(None, {"PLUGIN_ROOT": "/p", "CLAUDE_PLUGIN_ROOT": "/c"}) == "codex"
+    assert resolve_host(None, {"CODEX_HOME": "/x", "CLAUDE_CONFIG_DIR": "/c"}) == "codex"
+    assert resolve_host(None, {"PLUGIN_DATA": "/d", "CLAUDE_PLUGIN_ROOT": "/c"}) == "codex"
+
+    # Claude evidence when only Claude signals are present.
+    assert resolve_host(None, {"CLAUDE_PLUGIN_ROOT": "/c"}) == "claude"
+    assert resolve_host(None, {"CLAUDE_CONFIG_DIR": "/c"}) == "claude"
+
+
+def test_resolve_host_invalid_and_unresolvable():
+    """Invalid explicit/marker raise; a blank value falls through; no rung resolving raises."""
+    with pytest.raises(HostResolutionError):
+        resolve_host("bogus", {})
+    with pytest.raises(HostResolutionError):
+        resolve_host(None, {"CHINAMAXM_HOST": "nope"})
+    with pytest.raises(HostResolutionError):
+        resolve_host(None, {})  # no evidence at all
+
+    # A blank/whitespace explicit or marker is NOT a value — it falls through to the next rung.
+    assert resolve_host("   ", {"CLAUDE_PLUGIN_ROOT": "/c"}) == "claude"
+    assert resolve_host(None, {"CHINAMAXM_HOST": "   ", "PLUGIN_ROOT": "/p"}) == "codex"
+
+
+def test_setup_cli_host_flag_threads_and_errors(tmp_path, monkeypatch, capsys):
+    """--host threads to the engine; an unresolvable/invalid --host exits 2 before any engine."""
+    from chinamaxM import setup as setup_mod
+
+    engine, _ctx = make_engine(tmp_path, host="codex")
+    captured: dict = {}
+
+    def fake_engine(**kwargs):
+        captured.update(kwargs)
+        return engine
+
+    monkeypatch.setattr(setup_mod, "SetupEngine", fake_engine)
+    assert setup_mod.main(["--plan-only", "--host", "codex"]) == 0
+    assert captured.get("host") == "codex"
+
+    # An invalid --host exits 2 with a stderr message and NEVER constructs an engine.
+    built: list = []
+    monkeypatch.setattr(setup_mod, "SetupEngine", lambda **kw: built.append(kw) or engine)
+    code = setup_mod.main(["--plan-only", "--host", "bogus"])
+    assert code == 2 and built == []
+    assert "claude|codex" in capsys.readouterr().err
+
+
+def test_subprocess_generate_sets_host_env(tmp_path):
+    """The generation subprocess carries CHINAMAXM_SETUP_HOST (the retired INCLUDE_CODEX is gone)."""
+    rec = RecordingRun()
+    engine, _ctx = make_engine(tmp_path, host="codex", run=rec)
+    roots = {"claude": tmp_path / "claude", "codex": tmp_path / "codex"}
+    engine._subprocess_generate(engine._registry, roots, "codex")
+    call = next(c for c in rec.calls if "--_run-generation" in c["argv"])
+    assert call["env"]["CHINAMAXM_SETUP_HOST"] == "codex"
+    assert "CHINAMAXM_SETUP_INCLUDE_CODEX" not in call["env"]
+
+
+def test_codex_teardown_unwires_only_ours(tmp_path):
+    """Codex teardown strips only our chinamaxM- provider tables; foreign entries survive."""
+    codex = tmp_path / "codex"
+    codex.mkdir(parents=True)
+    config = codex / "config.toml"
+    config.write_text(
+        '[model_providers.chinamaxM-deepseek]\n'
+        'name = "chinamaxM-deepseek"\n'
+        'base_url = "http://127.0.0.1:8402/openai/deepseek"\n'
+        'wire_api = "responses"\n\n'
+        '[model_providers.acme]\n'
+        'name = "acme"\n'
+        'base_url = "http://example.com"\n\n'
+        '[history]\n'
+        'persistence = "save-all"\n',
+        encoding="utf-8",
+    )
+    engine, ctx = make_engine(tmp_path, host="codex")
+    plan = engine.build_teardown_plan()
+    ids = {s.id for s in plan.steps}
+    assert {"codex-unwire", "service-teardown", "python-path-remove"} <= ids
+    assert "env-flip-remove" not in ids  # no Claude flip step on a Codex teardown
+
+    report = engine.teardown(plan.digest)
+    assert report.exit_code == 0
+
+    text = config.read_text(encoding="utf-8")
+    assert "chinamaxM-deepseek" not in text  # ours removed
+    assert "acme" in text and "http://example.com" in text  # a foreign provider survives
+    assert "[history]" in text and 'persistence = "save-all"' in text  # unrelated content survives
+    assert ctx["service"].teardowns == 1  # the shared service is always removed
+
+
+def test_teardown_notes_shared_service_when_other_host_wired(tmp_path):
+    """The shared service is always removed; teardown NOTEs when the OTHER Host is still wired."""
+    claude = tmp_path / "claude"
+    claude.mkdir(parents=True)
+    (claude / "settings.json").write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": FLIP_URL}}), encoding="utf-8"
+    )
+    codex = tmp_path / "codex"
+    codex.mkdir(parents=True)
+    (codex / "config.toml").write_text(
+        '[model_providers.chinamaxM-deepseek]\n'
+        'name = "chinamaxM-deepseek"\n'
+        'base_url = "http://127.0.0.1:8402/openai/deepseek"\n'
+        'wire_api = "responses"\n',
+        encoding="utf-8",
+    )
+    # Claude teardown while Codex is wired ⇒ a note naming Codex.
+    engine, _ctx = make_engine(tmp_path, host="claude")
+    report = engine.teardown(engine.build_teardown_plan().digest)
+    assert any("Codex Host is still wired" in note for note in report.notes)
+    assert "NOTE:" in render_report(report)
 
 
 # ------------------------------------------ Platform prerequisites (detect + emit rows, no self-install)

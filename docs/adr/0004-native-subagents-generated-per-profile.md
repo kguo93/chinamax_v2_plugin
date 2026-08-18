@@ -129,3 +129,13 @@ operator-facing INSTANCE-name grammar changed. Rationale: the contract hook matc
 spawn NAME, and a bare-index name said nothing about chinamaxM or the task; anchoring it to
 `chinamaxm-<profile>-<task-slug>` fixes both. Cross-ref ADR 0005/0007 (as amended
 2026-08-18).
+
+**Amended 2026-08-18 (generation is Host-scoped at the surface — cross-ref ADR 0005 as
+amended 2026-08-18).** "Agent files are thin, setup-GENERATED artifacts" now means the
+invoking Host's artifact set only: a Claude-host setup generates the Claude agent `.md`s
+and never the Codex artifacts — even when `~/.codex` exists; that gate is retired — and a
+Codex-host setup generates the provider entries + role TOMLs and never the Claude `.md`s.
+A dual-Host machine gets each side's artifacts from that side's own setup run. The
+artifact model itself is untouched (ONE artifact per Profile per Host, dispatch-mutable
+model line, reserved names enforced at Registry load for both Hosts), and doctor's sync
+check likewise inspects only the invoking Host's artifacts (ADR 0005).

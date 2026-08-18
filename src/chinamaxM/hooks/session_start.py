@@ -1,9 +1,11 @@
 """SessionStart hook: warn-only when the Proxy port looks down but the Host is wired for it.
 
 Supervision is the OS's job (ADR 0009); this hook only nudges the operator toward the doctor
-surface at session start. It is HOST-AWARE (ADR 0005/0009), resolving the Host from the hook
-environment — Codex sets ``PLUGIN_ROOT``/``CODEX_*``; Claude sets
-``CLAUDE_PLUGIN_ROOT``/``CLAUDE_CONFIG_DIR`` — because the two Hosts wire routing differently:
+surface at session start. It is HOST-AWARE (ADR 0005/0009), resolving the Host through the
+shared ladder (:func:`chinamaxM.keyfiles.resolve_host`) — Codex evidence
+(``PLUGIN_ROOT``/``CODEX_HOME``) outranks Claude's (``CLAUDE_PLUGIN_ROOT``/``CLAUDE_CONFIG_DIR``)
+because Codex exposes Claude-compatible aliases — because the two Hosts wire routing
+differently:
 
 * **Claude**: routing rides the ``env.ANTHROPIC_BASE_URL`` flip in ``settings.json``. Warn iff
   the flip is present AND its loopback port is dead; point at ``/chinamaxM:doctor``.
@@ -20,7 +22,6 @@ import error) is swallowed to a silent exit 0.
 from __future__ import annotations
 
 import json
-import os
 import socket
 import sys
 from pathlib import Path
@@ -45,7 +46,10 @@ def main() -> int:
         ``0`` unconditionally (fail-open: never blocks a session, never exits nonzero).
     """
     try:
-        message = _codex_warning() if _resolve_host() == "codex" else _claude_warning()
+        host = _resolve_host()
+        if host is None:
+            return 0  # unresolvable Host ⇒ silent (fail-open, never default to claude)
+        message = _codex_warning() if host == "codex" else _claude_warning()
         if message:
             sys.stdout.write(json.dumps({"systemMessage": message}) + "\n")
     except Exception:  # noqa: BLE001 - a warn-only hook must never block or fail a session
@@ -53,13 +57,19 @@ def main() -> int:
     return 0
 
 
-def _resolve_host() -> str:
-    """Resolve the Host from the hook environment (Claude signals win over Codex signals)."""
-    if os.environ.get("CLAUDE_PLUGIN_ROOT") or os.environ.get("CLAUDE_CONFIG_DIR"):
-        return "claude"
-    if os.environ.get("PLUGIN_ROOT") or os.environ.get("CODEX_HOME"):
-        return "codex"
-    return "claude"
+def _resolve_host() -> str | None:
+    """Resolve the Host through the shared ladder, or ``None`` when it cannot be determined.
+
+    Codex evidence outranks Claude's (Codex exposes Claude-compatible aliases). Unlike the
+    mutating surfaces, an unresolvable Host is NOT an error here — the warn-only hook exits
+    silently rather than guessing a Host (ADR 0005/0009 as amended 2026-08-18).
+    """
+    from chinamaxM.keyfiles import HostResolutionError, resolve_host
+
+    try:
+        return resolve_host(None)
+    except HostResolutionError:
+        return None
 
 
 def _claude_warning() -> str | None:

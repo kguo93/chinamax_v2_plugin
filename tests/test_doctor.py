@@ -156,8 +156,13 @@ def install(tmp_path, monkeypatch):
 
 
 def run(inst: Install, **overrides):
-    """Run the doctor over an install with healthy defaults, honoring per-test overrides."""
+    """Run the doctor over an install with healthy defaults, honoring per-test overrides.
+
+    ``host`` defaults to ``"claude"`` — the doctor is Host-scoped (ADR 0005 as amended
+    2026-08-18), so each run yields ONE Host's roster; Codex-side tests pass ``host="codex"``.
+    """
     kwargs = dict(
+        host="claude",
         claude_root=inst.claude,
         codex_root=inst.codex,
         overlay_path=inst.overlay,
@@ -179,8 +184,8 @@ def set_settings(inst: Install, text: str) -> None:
 
 
 def test_all_valid_install_is_clean(install):
-    """The fully-valid fixture yields no FAIL findings and exit 0 (baseline)."""
-    findings, code = run(install)
+    """The fully-valid fixture yields no FAIL findings and exit 0 on EITHER Host (baseline)."""
+    findings, code = run(install)  # claude host
     assert code == 0, [f for f in findings if f.status in ("fail", "error")]
     assert one(findings, "registry").status == "ok"
     assert one(findings, "conda").status == "ok"
@@ -189,7 +194,17 @@ def test_all_valid_install_is_clean(install):
     assert one(findings, "env-flip-present").status == "ok"
     assert one(findings, "env-flip-target").status == "ok"
     assert one(findings, "drift-claude").status == "ok"
-    assert one(findings, "drift-codex").status == "ok"
+    # Host-scoped: the Claude roster carries NO Codex-side rows.
+    assert not find(findings, "drift-codex")
+    assert not find(findings, "codex-strict-config")
+
+    # The Codex host's roster is likewise clean, with no Claude-side rows.
+    codex_findings, codex_code = run(install, host="codex")
+    assert codex_code == 0, [f for f in codex_findings if f.status in ("fail", "error")]
+    assert one(codex_findings, "drift-codex").status == "ok"
+    assert one(codex_findings, "codex-strict-config").status == "skipped"
+    assert not find(codex_findings, "drift-claude")
+    assert not find(codex_findings, "env-flip-present")
 
 
 def test_conda_missing_env(install):
@@ -286,42 +301,49 @@ def test_env_flip_env_not_dict(install):
 
 
 def test_drift_claude_only(install):
+    """A hand-edited Claude agent FAILs the Claude-host drift check; no Codex row appears."""
     agent = install.claude / "agents" / "deepseek.md"
     agent.write_text(agent.read_text(encoding="utf-8") + "\nhand-edited body line\n", encoding="utf-8")
-    findings, code = run(install)
+    findings, code = run(install)  # claude host
     assert one(findings, "drift-claude").status == "fail"
-    assert one(findings, "drift-codex").status == "ok"
+    assert not find(findings, "drift-codex")  # the other Host never appears
     assert code == 1
 
 
 def test_drift_codex_only(install):
+    """A missing Codex role TOML FAILs the Codex-host drift check; no Claude row appears."""
     (install.codex / "agents" / "deepseek.toml").unlink()
-    findings, code = run(install)
-    assert one(findings, "drift-claude").status == "ok"
+    findings, code = run(install, host="codex")
     assert one(findings, "drift-codex").status == "fail"
+    assert not find(findings, "drift-claude")  # the other Host never appears
     assert code == 1
 
 
 def test_strict_config_demoted_to_skipped(install):
-    """The strict-config check ships skipped (setup-only) — no codex command is ever run."""
-    findings, code = run(install)
+    """The Codex-host strict-config check ships skipped (setup-only) — no codex command runs."""
+    findings, code = run(install, host="codex")
     f = one(findings, "codex-strict-config")
     assert f.status == "skipped" and "setup-only" in f.detail
     assert code == 0  # a skipped FAIL-level check never flips the exit
+    # The check is Codex-only: it does NOT appear on the Claude host's roster.
+    claude_findings, _ = run(install)
+    assert not find(claude_findings, "codex-strict-config")
 
 
-def test_codex_root_absent_skips_codex_checks(tmp_path, install):
+def test_codex_root_absent_on_codex_host(tmp_path, install):
+    """A Codex-host doctor with an absent Codex root: codex checks skip; drift FAILs (missing)."""
     absent = tmp_path / "no-codex"
-    findings, _ = run(install, codex_root=absent)
+    findings, _ = run(install, host="codex", codex_root=absent)
     assert one(findings, "codex-strict-config").status == "skipped"
     assert str(absent) in one(findings, "codex-strict-config").detail
     assert one(findings, "codex-version").status == "skipped"
-    assert one(findings, "drift-codex").status == "skipped"
+    # Host scoping supersedes the old drift-codex skip: absent artifacts are genuine drift.
+    assert one(findings, "drift-codex").status == "fail"
 
 
 def test_codex_binary_absent_with_root_present(install):
     """codex binary absent + Codex root present: strict-config skipped, version WARN."""
-    findings, _ = run(install, run=make_run(codex=FileNotFoundError()))
+    findings, _ = run(install, host="codex", run=make_run(codex=FileNotFoundError()))
     assert one(findings, "codex-strict-config").status == "skipped"
     version = one(findings, "codex-version")
     assert version.status == "warn" and "could not determine" in version.detail
@@ -343,14 +365,20 @@ def test_key_missing_in_one_file(install):
 
 
 def test_key_present_claude_missing_codex(install):
+    """Host-scoped keys: the Claude roster reads only the Claude file, the Codex roster only Codex."""
     registry = load_registry(overlay_path=install.overlay)
     keys = "".join(
         f"{p.api_key_env}={CANARY}\n" for p in registry.profiles.values() if p.api_key_env != "DEEPSEEK_API_KEY"
     )
     (install.codex / "model-keys.env").write_text(keys, encoding="utf-8")
-    findings, _ = run(install)
-    assert one(findings, "key-claude-deepseek").status == "ok"
-    assert one(findings, "key-codex-deepseek").status == "warn"
+
+    claude_findings, _ = run(install)  # claude host: full Claude key file
+    assert one(claude_findings, "key-claude-deepseek").status == "ok"
+    assert not find(claude_findings, "key-codex-deepseek")  # the Codex file is never read here
+
+    codex_findings, _ = run(install, host="codex")  # codex host: deepseek missing
+    assert one(codex_findings, "key-codex-deepseek").status == "warn"
+    assert not find(codex_findings, "key-claude-deepseek")
 
 
 def test_subagent_model_in_process_env(install, monkeypatch):
@@ -375,13 +403,13 @@ def test_subagent_model_in_settings(install, monkeypatch):
 
 
 def test_codex_version_mismatch(install):
-    findings, _ = run(install, run=make_run(codex=CP(["codex"], 0, "codex 0.145.0\n", "")))
+    findings, _ = run(install, host="codex", run=make_run(codex=CP(["codex"], 0, "codex 0.145.0\n", "")))
     f = one(findings, "codex-version")
     assert f.status == "warn" and "0.145.0" in f.detail and CODEX_BASELINE in f.detail
 
 
 def test_codex_version_unparseable(install):
-    findings, _ = run(install, run=make_run(codex=CP(["codex"], 0, "no version here\n", "")))
+    findings, _ = run(install, host="codex", run=make_run(codex=CP(["codex"], 0, "no version here\n", "")))
     f = one(findings, "codex-version")
     assert f.status == "warn" and "could not determine" in f.detail
 
@@ -452,28 +480,33 @@ async def test_doctor_never_mutates_or_spends(install, fake_provider):
 
 
 def test_profiles_renderer(install):
+    """The Claude-host /profiles shows the Claude key column ONLY — no Codex column."""
     text, code = render_profiles(
-        claude_root=install.claude, codex_root=install.codex, overlay_path=install.overlay
+        host="claude", claude_root=install.claude, codex_root=install.codex, overlay_path=install.overlay
     )
     assert code == 0
     for name in ("deepseek", "mimo", "glm", "minimax", "kimi", "qwen"):
         assert name in text
     assert "DEEPSEEK_API_KEY" in text
     assert "claude key: PRESENT" in text
+    assert "codex key" not in text  # the other Host never appears
     assert CANARY not in text  # ADR 0006: never print a key value
 
 
-def test_profiles_codex_root_absent(tmp_path, install):
-    absent = tmp_path / "no-codex"
-    text, code = render_profiles(claude_root=install.claude, codex_root=absent, overlay_path=install.overlay)
+def test_profiles_codex_host(install):
+    """The Codex-host /profiles shows the Codex key column ONLY — no Claude column."""
+    text, code = render_profiles(
+        host="codex", claude_root=install.claude, codex_root=install.codex, overlay_path=install.overlay
+    )
     assert code == 0
-    assert f"codex key: skipped (codex root {absent} absent)" in text
+    assert "codex key: PRESENT" in text
+    assert "claude key" not in text  # the other Host never appears
 
 
 def test_profiles_registry_unreadable(install):
     install.overlay.write_text("{ not json", encoding="utf-8")
     text, code = render_profiles(
-        claude_root=install.claude, codex_root=install.codex, overlay_path=install.overlay
+        host="claude", claude_root=install.claude, codex_root=install.codex, overlay_path=install.overlay
     )
     assert code == 1
     assert "registry unreadable" in text
@@ -490,7 +523,7 @@ def test_profiles_shows_current_model_after_rewrite(install, monkeypatch):
     monkeypatch.setenv("CHINAMAXM_CODEX_HOME", str(install.codex))
     set_model("claude", "deepseek", "deepseek-v4-flash")
     text, _ = render_profiles(
-        claude_root=install.claude, codex_root=install.codex, overlay_path=install.overlay
+        host="claude", claude_root=install.claude, codex_root=install.codex, overlay_path=install.overlay
     )
     assert "current model: deepseek-v4-flash" in text
 
@@ -507,6 +540,10 @@ def _session_start_command() -> str:
 
 def _run_session_start(claude_root: Path) -> subprocess.CompletedProcess:
     env = os.environ.copy()
+    # Present as a pure Claude session: strip any ambient Codex/marker evidence so the shared
+    # ladder resolves "claude" deterministically (Codex evidence would otherwise outrank it).
+    for var in ("PLUGIN_ROOT", "PLUGIN_DATA", "CODEX_HOME", "CHINAMAXM_HOST", "CHINAMAXM_CODEX_HOME"):
+        env.pop(var, None)
     env["CLAUDE_PLUGIN_ROOT"] = str(REPO_ROOT)
     env["CHINAMAXM_PYTHON"] = sys.executable
     env["CHINAMAXM_CLAUDE_HOME"] = str(claude_root)
@@ -617,6 +654,13 @@ def test_codex_surface_twins_exist_and_match_cli():
     # Same pinned CLI invocations as the Claude command files.
     assert DOCTOR_CLI in doctor_cmd and DOCTOR_CLI in doctor_skill
     assert PROFILES_CLI in profiles_cmd and PROFILES_CLI in profiles_skill
+
+    # Host-scoped surfaces (ADR 0005 as amended): the Claude commands pass --host claude, the
+    # Codex skill twins pass --host codex.
+    assert DOCTOR_CLI + " --host claude" in doctor_cmd
+    assert PROFILES_CLI + " --host claude" in profiles_cmd
+    assert DOCTOR_CLI + " --host codex" in doctor_skill
+    assert PROFILES_CLI + " --host codex" in profiles_skill
 
     # Codex twins carry the headless stdin-close guidance.
     assert "< /dev/null" in doctor_skill

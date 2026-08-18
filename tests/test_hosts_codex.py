@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from chinamaxM.hooks import session_start
 from chinamaxM.hooks.worker_contract import RELAY_RULE, WORKER_CONTRACT_CODEX
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -556,3 +557,63 @@ def test_codex_sessionstart_live(tmp_path):
     finally:
         listener.close()
     assert result.returncode == 0 and result.stdout.strip() == "", result.stdout
+
+
+# --------------------------------------------- test 9 (SessionStart Host-resolution ladder)
+
+
+def test_sessionstart_resolve_host_ladder(monkeypatch):
+    """The hook resolves the Host codex-first; unresolvable ⇒ None (silent fail-open, no guess)."""
+    # Codex evidence outranks Claude aliases (Codex exposes Claude-compatible aliases) — this
+    # is the fix for the old claude-first default that misread a Codex session as Claude.
+    monkeypatch.setattr(os, "environ", {"PLUGIN_ROOT": "/p", "CLAUDE_PLUGIN_ROOT": "/c"})
+    assert session_start._resolve_host() == "codex"
+    monkeypatch.setattr(os, "environ", {"CODEX_HOME": "/x", "CLAUDE_CONFIG_DIR": "/c"})
+    assert session_start._resolve_host() == "codex"
+    # Claude-only evidence ⇒ claude.
+    monkeypatch.setattr(os, "environ", {"CLAUDE_CONFIG_DIR": "/c"})
+    assert session_start._resolve_host() == "claude"
+    # No evidence at all ⇒ None (never defaults to claude).
+    monkeypatch.setattr(os, "environ", {})
+    assert session_start._resolve_host() is None
+
+
+def test_sessionstart_main_silent_when_unresolvable(monkeypatch, capsys):
+    """main() exits 0 with NO output when the Host cannot be resolved (fail-open)."""
+    monkeypatch.setattr(os, "environ", {})
+    assert session_start.main() == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_codex_sessionstart_codex_first_live(tmp_path):
+    """LIVE: with BOTH Codex evidence and Claude aliases set, the hook warns via the CODEX path."""
+    configured = tmp_path / "codex-cfg"
+    configured.mkdir()
+    (configured / "config.toml").write_text(
+        '[model_providers.chinamaxM-deepseek]\n'
+        'name = "chinamaxM-deepseek"\n'
+        'base_url = "http://127.0.0.1:9/openai/deepseek"\n'
+        'wire_api = "responses"\n',
+        encoding="utf-8",
+    )
+    dead_home = tmp_path / "home"
+    _codex_overlay(dead_home, _free_port())
+
+    hooks = json.loads(CODEX_HOOKS_JSON.read_text(encoding="utf-8"))
+    command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"].replace(
+        "${PLUGIN_ROOT}", str(REPO_ROOT)
+    )
+    env = os.environ.copy()
+    env.pop("CHINAMAXM_HOST", None)
+    env["PLUGIN_ROOT"] = str(REPO_ROOT)  # Codex evidence
+    env["CLAUDE_PLUGIN_ROOT"] = str(REPO_ROOT)  # Claude alias ALSO present — must be outranked
+    env["CHINAMAXM_PYTHON"] = sys.executable
+    env["CHINAMAXM_CODEX_HOME"] = str(configured)
+    env["CHINAMAXM_CLAUDE_HOME"] = str(dead_home)
+    result = subprocess.run(
+        command, shell=True, input='{"hook_event_name":"SessionStart"}',
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert "chinamaxM-doctor" in payload["systemMessage"]  # the Codex warning path fired

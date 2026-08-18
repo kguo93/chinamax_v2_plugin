@@ -244,8 +244,10 @@ def _provider_label(provider_id: str) -> str:
     return f"model_providers.{provider_id}"
 
 
-def expected_artifacts(registry: Registry, roots: Mapping[str, Path]) -> dict[Path, str]:
-    """Compute the expected whole-file artifacts for every Profile.
+def expected_artifacts(
+    registry: Registry, roots: Mapping[str, Path], host: str | None = None
+) -> dict[Path, str]:
+    """Compute the expected whole-file artifacts for every Profile, optionally per Host.
 
     Provider entries are NOT whole-file artifacts (``config.toml`` is only partially
     ours), so they are excluded here and handled structurally by :func:`detect_drift` and
@@ -254,17 +256,22 @@ def expected_artifacts(registry: Registry, roots: Mapping[str, Path]) -> dict[Pa
     Args:
         registry: The resolved Registry.
         roots: A ``{"claude": Path, "codex": Path}`` mapping of Host roots.
+        host: ``"claude"`` → only Claude agent ``.md`` artifacts; ``"codex"`` → only Codex
+            role ``.toml`` artifacts; ``None`` → both (ADR 0004 as amended 2026-08-18, the
+            surfaces scope generation to the single invoking Host).
 
     Returns:
-        An ordered ``{path: content}`` mapping (Claude agents and Codex role TOMLs), with
-        stable ordering and no timestamps.
+        An ordered ``{path: content}`` mapping (Claude agents and/or Codex role TOMLs),
+        with stable ordering and no timestamps.
     """
     claude_agents = _claude_agents_dir(roots)
     codex_agents = _codex_agents_dir(roots)
     artifacts: dict[Path, str] = {}
     for profile in registry.profiles.values():
-        artifacts[claude_agents / f"{profile.name}.md"] = _claude_agent_content(profile)
-        artifacts[codex_agents / f"{profile.name}.toml"] = _codex_role_content(profile)
+        if host in (None, "claude"):
+            artifacts[claude_agents / f"{profile.name}.md"] = _claude_agent_content(profile)
+        if host in (None, "codex"):
+            artifacts[codex_agents / f"{profile.name}.toml"] = _codex_role_content(profile)
     return artifacts
 
 
@@ -567,7 +574,9 @@ def _reconcile_providers(
 # ----------------------------------------------------------------- drift detection
 
 
-def detect_drift(registry: Registry, roots: Mapping[str, Path]) -> dict[str, object]:
+def detect_drift(
+    registry: Registry, roots: Mapping[str, Path], host: str | None = None
+) -> dict[str, object]:
     """Classify on-disk state against the expected artifact set without mutating.
 
     The model line is dispatch-mutable state, so it is excluded from the stale comparison
@@ -578,6 +587,9 @@ def detect_drift(registry: Registry, roots: Mapping[str, Path]) -> dict[str, obj
     Args:
         registry: The resolved Registry.
         roots: A ``{"claude": Path, "codex": Path}`` mapping of Host roots.
+        host: ``"claude"`` inspects only the Claude agents; ``"codex"`` inspects only the
+            Codex role TOMLs + provider tables; ``None`` inspects both. Doctor scopes this
+            to the invoking Host (ADR 0005 as amended 2026-08-18).
 
     Returns:
         ``{"missing", "stale", "foreign", "conflicts"}`` sorted string lists plus
@@ -591,7 +603,7 @@ def detect_drift(registry: Registry, roots: Mapping[str, Path]) -> dict[str, obj
     conflicts: list[str] = []
     model_lines: dict[str, str | None] = {}
 
-    expected = expected_artifacts(registry, roots)
+    expected = expected_artifacts(registry, roots, host)
     expected_paths = set(expected)
 
     for path, content in expected.items():
@@ -610,7 +622,12 @@ def detect_drift(registry: Registry, roots: Mapping[str, Path]) -> dict[str, obj
         if strip(current) != strip(content):
             stale.append(str(path))
 
-    for directory in (_claude_agents_dir(roots), _codex_agents_dir(roots)):
+    scan_dirs: list[Path] = []
+    if host in (None, "claude"):
+        scan_dirs.append(_claude_agents_dir(roots))
+    if host in (None, "codex"):
+        scan_dirs.append(_codex_agents_dir(roots))
+    for directory in scan_dirs:
         if not directory.is_dir():
             continue
         for entry in directory.iterdir():
@@ -620,7 +637,8 @@ def detect_drift(registry: Registry, roots: Mapping[str, Path]) -> dict[str, obj
             if text is not None and _has_marker(text):
                 foreign.append(str(entry))
 
-    _classify_providers(registry, roots, missing, stale, foreign, conflicts)
+    if host in (None, "codex"):
+        _classify_providers(registry, roots, missing, stale, foreign, conflicts)
 
     return {
         "missing": sorted(missing),
@@ -667,12 +685,14 @@ def _classify_providers(
 # --------------------------------------------------------------------- regeneration
 
 
-def regenerate(registry: Registry, roots: Mapping[str, Path]) -> dict[str, list[str]]:
-    """Converge on-disk artifacts to the expected set, then report what changed.
+def regenerate(
+    registry: Registry, roots: Mapping[str, Path], host: str | None = None
+) -> dict[str, list[str]]:
+    """Converge the invoking Host's on-disk artifacts to the expected set, then report.
 
-    Preflight (name validation and a ``config.toml`` parse) runs first across both Hosts,
-    so no Claude file is written when the Codex side would fail. Only marker-bearing files
-    and ``chinamaxM-`` tables are ever overwritten, deleted, or pruned; a conflict path (an
+    Preflight (name validation, and — for the Codex side — a ``config.toml`` parse) runs
+    first, so no file is written when preflight would fail. Only marker-bearing files and
+    ``chinamaxM-`` tables are ever overwritten, deleted, or pruned; a conflict path (an
     expected path occupied by a marker-less file) is skipped and re-reported. Writes are
     byte-identical-skipped, atomic, and mode-preserving; a rewritten model line is reset to
     the Profile default because the expected content carries the default.
@@ -680,6 +700,10 @@ def regenerate(registry: Registry, roots: Mapping[str, Path]) -> dict[str, list[
     Args:
         registry: The resolved Registry.
         roots: A ``{"claude": Path, "codex": Path}`` mapping of Host roots.
+        host: ``"claude"`` writes ONLY the Claude agent ``.md``s (never touching the Codex
+            root); ``"codex"`` writes ONLY the provider entries + role TOMLs (never touching
+            the Claude agents dir); ``None`` writes both. The surfaces scope this to the
+            single invoking Host (ADR 0004/0005/0006 as amended 2026-08-18).
 
     Returns:
         ``{"written", "skipped", "pruned", "conflicts"}`` sorted string lists.
@@ -690,15 +714,20 @@ def regenerate(registry: Registry, roots: Mapping[str, Path]) -> dict[str, list[
     import tomlkit  # lazy (Bootstrap): env-only dep, never imported at module load
 
     _validate_profile_names(registry)
+    do_claude = host in (None, "claude")
+    do_codex = host in (None, "codex")
+
     config_path = _config_path(roots)
-    config_doc = _parse_config_or_raise(config_path)
+    # Parse (and shape-validate) the Codex config only when the Codex side is in scope, so a
+    # Claude-host regeneration never reads or requires ``~/.codex/config.toml``.
+    config_doc = _parse_config_or_raise(config_path) if do_codex else None
 
     written: list[str] = []
     skipped: list[str] = []
     pruned: list[str] = []
     conflicts: list[str] = []
 
-    expected = expected_artifacts(registry, roots)
+    expected = expected_artifacts(registry, roots, host)
     expected_paths = set(expected)
 
     for path, content in expected.items():
@@ -712,7 +741,12 @@ def regenerate(registry: Registry, roots: Mapping[str, Path]) -> dict[str, list[
         _atomic_write(path, content.encode("utf-8"))
         written.append(str(path))
 
-    for directory in (_claude_agents_dir(roots), _codex_agents_dir(roots)):
+    scan_dirs: list[Path] = []
+    if do_claude:
+        scan_dirs.append(_claude_agents_dir(roots))
+    if do_codex:
+        scan_dirs.append(_codex_agents_dir(roots))
+    for directory in scan_dirs:
         if not directory.is_dir():
             continue
         for entry in sorted(directory.iterdir()):
@@ -723,18 +757,19 @@ def regenerate(registry: Registry, roots: Mapping[str, Path]) -> dict[str, list[
                 entry.unlink()
                 pruned.append(str(entry))
 
-    config_existed = config_doc is not None
-    if config_doc is None:
-        config_doc = tomlkit.document()
-    table_written, table_skipped, table_pruned = _reconcile_providers(config_doc, registry)
-    new_text = tomlkit.dumps(config_doc)
-    original_text = config_path.read_text(encoding="utf-8") if config_existed else None
-    if new_text != original_text:
-        _atomic_write(config_path, new_text.encode("utf-8"))
-        written.extend(table_written)
-    else:
-        skipped.extend(table_skipped)
-    pruned.extend(table_pruned)
+    if do_codex:
+        config_existed = config_doc is not None
+        if config_doc is None:
+            config_doc = tomlkit.document()
+        table_written, table_skipped, table_pruned = _reconcile_providers(config_doc, registry)
+        new_text = tomlkit.dumps(config_doc)
+        original_text = config_path.read_text(encoding="utf-8") if config_existed else None
+        if new_text != original_text:
+            _atomic_write(config_path, new_text.encode("utf-8"))
+            written.extend(table_written)
+        else:
+            skipped.extend(table_skipped)
+        pruned.extend(table_pruned)
 
     return {
         "written": sorted(written),
@@ -742,6 +777,51 @@ def regenerate(registry: Registry, roots: Mapping[str, Path]) -> dict[str, list[
         "pruned": sorted(pruned),
         "conflicts": sorted(conflicts),
     }
+
+
+# ----------------------------------------------------------------- provider unwire
+
+
+def remove_provider_entries(roots: Mapping[str, Path]) -> dict[str, list[str]]:
+    """Strip every generated ``chinamaxM-`` provider table from the Codex ``config.toml``.
+
+    The Codex-side teardown unwire (ADR 0005 as amended 2026-08-18). Reuses this module's
+    marker-safe, mode-preserving atomic write: only tables whose key carries the
+    :data:`PROVIDER_PREFIX` are deleted, so a foreign ``model_providers`` entry and every
+    other byte of ``config.toml`` survive the round-trip. An absent file, or a config with
+    no matching entries, is a no-op.
+
+    Args:
+        roots: A ``{"claude": Path, "codex": Path}`` mapping of Host roots.
+
+    Returns:
+        ``{"removed": [...]}`` sorted ``model_providers.chinamaxM-<profile>`` labels that
+        were actually deleted (empty when nothing matched).
+    """
+    import tomlkit  # lazy (Bootstrap): env-only dep, never imported at module load
+
+    config_path = _config_path(roots)
+    text = _read_text(config_path)
+    if text is None:
+        return {"removed": []}
+    try:
+        doc = tomlkit.parse(text)
+    except Exception:  # noqa: BLE001 - an unparseable config is left untouched, never a crash
+        return {"removed": []}
+
+    providers = doc.get("model_providers")
+    removed: list[str] = []
+    if providers is not None and hasattr(providers, "items"):
+        for key in list(providers):
+            if str(key).startswith(PROVIDER_PREFIX):
+                del providers[key]
+                removed.append(_provider_label(key))
+
+    if removed:
+        new_text = tomlkit.dumps(doc)
+        if new_text != text:
+            _atomic_write(config_path, new_text.encode("utf-8"))
+    return {"removed": sorted(removed)}
 
 
 # ------------------------------------------------------------------ model rewrite
