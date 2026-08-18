@@ -77,3 +77,55 @@ rewrite; reserved names; field-list corrections).**
   entry also carries its `name` display field; `tools: null` in the Registry means
   generation OMITS the tools frontmatter key entirely, letting the host grant its
   standard toolset (which includes Agent, so Workers may spawn Explore subagents).
+
+**Amended 2026-08-15 (Host project-doc symmetry live-verified; no compensation needed).**
+A spawned Codex role receives the workspace `AGENTS.md` in its context exactly as a
+top-level thread does — verified on Codex 0.147.0 against an isolated `CODEX_HOME` with a
+fresh, non-forked child (`session_meta.forked_from_id: None`), whose rollout JSONL carries
+the same `# AGENTS.md instructions for <cwd>` block as its parent. Codex ignores `CLAUDE.md`
+by default (`project_doc_fallback_filenames` is the opt-in knob). Claude Code symmetrically
+loads the full CLAUDE.md hierarchy into every subagent except the built-in `Explore` and
+`Plan`. So a Worker on either Host gets that Host's project doc ON TOP OF the shared
+`WORKER_INSTRUCTIONS` generation emits, and generation must NOT try to inline project
+context to compensate. When testing what a Worker can see, assert on the rollout JSONL under
+`$CODEX_HOME/sessions/` — never on a child's self-report, which under-reports — and check
+`forked_from_id` first, since a full-history fork confounds any inheritance test.
+
+**Amended 2026-08-16 (Workers are pointed at their Host's lazy-loaded MCP tools).**
+`WORKER_INSTRUCTIONS` gains item 5: MCP tools exist on both Hosts, their schemas load ON
+DEMAND, and a Worker looks one up only when its task needs it — `ToolSearch` on Claude,
+`ALL_TOOLS` / `tools.mcp__<server>__<tool>` inside the `exec` sandbox on Codex. Schemas are
+NOT preloaded; a Worker is told where to look, nothing more. Both Hosts hand a Worker the
+parent's MCP servers (live-verified 2026-08-15: a Claude subagent called
+`mcp__codebase-memory-mcp__list_projects` successfully, and a Codex role enumerated the
+same server's fourteen tools plus remote plugin tools from `ALL_TOOLS`), so the gap was
+never availability — it is that a non-Claude Worker model has no reason to suspect a
+deferred schema exists and will conclude it has no MCP tools. Two consequences for
+generation: (a) a Profile's `tools` override is an ALLOWLIST on Claude and silently drops
+every MCP tool unless it also lists `mcp__<server>` or `mcp__<server>__*` — and a
+plugin-bundled server needs the longer `mcp__plugin_<plugin>_<server>__<tool>` form, which
+a bare pattern never matches; (b) the generated Codex role TOML has no tool-restriction
+key at all, so a Codex Worker always gets the full inherited surface. That restriction
+asymmetry between the Hosts is real and remains OPEN — item 5 does not close it.
+
+**Amended 2026-08-18 (Worker instance-name grammar carries a `chinamaxm-` prefix; default
+names are task-descriptive; the shared matcher accepts the new form only).** The 2026-08-13
+amendment read: "Operator-chosen worker names at dispatch are `<profile>-<suffix>` with a
+NON-EMPTY lowercase `[a-z0-9-]` suffix, on both hosts." **Reversed**: a Worker INSTANCE name
+(the spawn `name`, distinct from the generated artifact — still the bare `<profile>`) is now
+`chinamaxm-<profile>-<suffix>` with a non-empty lowercase `[a-z0-9-]` suffix, on both Hosts.
+The default name is `chinamaxm-<profile>-<task-slug>` — a short kebab slug the dispatching
+Host derives from the prompt so the name references chinamaxM and the task rather than a bare
+Profile index (`chinamaxm-deepseek-repo-summary`); a session collision appends `-2`, `-3`, …;
+an unsloggable prompt falls back to the numeric `chinamaxm-<profile>-<n>` (lowest-unused,
+counting running AND completed Workers). Consequences: (a) the single shared matcher
+`matches_generated_agent` (via the `WORKER_NAME_PREFIX` constant) now accepts EXACTLY the
+bare `<profile>` (the subagent_type/role on the spawn call) and
+`chinamaxm-<profile>-<non-empty suffix>` — the legacy `<profile>-<suffix>` instance form
+(`deepseek-1`) no longer fires the Worker contract; (b) both Host surfaces
+(`commands/task.md`, `skills/chinamaxM-task/SKILL.md`) mint and accept only the new grammar;
+(c) the reserved-name rule and one-artifact-per-Profile rule are untouched — only the
+operator-facing INSTANCE-name grammar changed. Rationale: the contract hook matches on the
+spawn NAME, and a bare-index name said nothing about chinamaxM or the task; anchoring it to
+`chinamaxm-<profile>-<task-slug>` fixes both. Cross-ref ADR 0005/0007 (as amended
+2026-08-18).

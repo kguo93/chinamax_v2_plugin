@@ -21,9 +21,11 @@ from chinamaxM.generate import (
     CLAUDE_MARKER,
     CODEX_MARKER,
     WORKER_INSTRUCTIONS,
+    WORKER_NAME_PREFIX,
     GenerationError,
     detect_drift,
     expected_artifacts,
+    matches_generated_agent,
     regenerate,
     resolve_roots,
     set_model,
@@ -215,6 +217,46 @@ def test_role_tomls(roots):
     mimo = tomllib.loads((roots["codex"] / "agents" / "mimo.toml").read_text())
     assert "model_context_window" not in mimo  # Registry pins none for mimo
     assert mimo["model"] == "mimo-v2.5-pro"
+
+
+def test_worker_instructions_point_at_lazy_mcp_discovery():
+    """AC-4: the shared Worker prompt names MCP and BOTH Hosts' on-demand lookup paths."""
+    assert "MCP" in WORKER_INSTRUCTIONS
+    assert "ToolSearch" in WORKER_INSTRUCTIONS  # Claude discovery path
+    assert "ALL_TOOLS" in WORKER_INSTRUCTIONS  # Codex exec-sandbox discovery path
+
+
+def test_matches_generated_agent_grammar():
+    """The shared matcher accepts bare ``<profile>`` and ``chinamaxm-<profile>-<suffix>`` only.
+
+    Anchored, case-sensitive, and Registry-derived (ADR 0004 as amended 2026-08-18). This is
+    the single seam both Host hooks reuse, so its boundaries are pinned directly here rather
+    than only through the subprocess-level host tests: the retired legacy instance form, the
+    empty-suffix / no-suffix boundaries, and the anchored substring traps must all reject.
+    """
+    profiles = ["deepseek", "kimi", "glm"]
+
+    # Accept: the bare Profile (subagent_type/role on the spawn call) and the canonical
+    # named instance form (default slug and a short custom suffix).
+    assert matches_generated_agent("deepseek", profiles)
+    assert matches_generated_agent("chinamaxm-deepseek-repo-summary", profiles)
+    assert matches_generated_agent("chinamaxm-deepseek-x", profiles)
+
+    # Reject: the RETIRED legacy `<profile>-<suffix>` instance form.
+    assert not matches_generated_agent("deepseek-1", profiles)
+
+    # Reject: the two suffix boundaries — a trailing dash (empty suffix) and no suffix — so
+    # the `len(name) > len(prefix)` guard is covered directly.
+    assert not matches_generated_agent(f"{WORKER_NAME_PREFIX}deepseek-", profiles)
+    assert not matches_generated_agent(f"{WORKER_NAME_PREFIX}deepseek", profiles)
+
+    # Reject: anchored substring traps (prefix must match exactly, not as a substring).
+    assert not matches_generated_agent("chinamaxm-kimono-x", profiles)  # kimi vs kimono
+    assert not matches_generated_agent("chinamaxm-glmax-x", profiles)  # glm vs glmax
+
+    # Reject: an unknown Profile and a built-in agent name.
+    assert not matches_generated_agent("chinamaxm-unknown-x", profiles)
+    assert not matches_generated_agent("Explore", profiles)
 
 
 # --------------------------------------------------------------------- idempotence

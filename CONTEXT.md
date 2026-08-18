@@ -60,6 +60,14 @@ A Profile's list of request fields the provider rejects or ignores, dropped on w
 A native host subagent (Claude subagent or Codex role child) generated from a Profile, whose entire agentic loop rides the Proxy to that Profile's provider. First-class in the host: spawnable, addressable, background-capable, transcript-persisted.
 _Avoid_: Job, Bridge Agent, Runtime worker (old architecture)
 
+**Worker name**:
+The address of a dispatched Worker instance: `chinamaxm-<profile>-<suffix>`, where the
+suffix is a short task-descriptive slug (or a numeric fallback when the task yields none).
+Distinct from the Generated agent, which is named for the bare Profile. Steering and
+continuation address a Worker by this name.
+_Avoid_: a bare Profile-indexed name (`deepseek-1`) — retired; it named neither chinamaxM
+nor the task.
+
 **Generated agent**:
 A thin, setup-generated artifact — a Claude agent `.md` or a Codex role TOML — ONE per Profile, never hand-maintained. Its model line is dispatch-mutable state: `/task model=…` rewrites it before spawning, and regeneration resets it to the Profile's default. All other drift from the Registry is a doctor finding; regeneration and the dispatch-time model-line rewrite are the only edit paths.
 

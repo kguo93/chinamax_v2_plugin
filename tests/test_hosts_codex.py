@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from chinamaxM.hooks.worker_contract import RELAY_RULE, WORKER_CONTRACT
+from chinamaxM.hooks.worker_contract import RELAY_RULE, WORKER_CONTRACT_CODEX
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CODEX_HOOKS_JSON = REPO_ROOT / "hooks" / "codex-hooks.json"
@@ -207,19 +207,26 @@ def test_contract_in_codex_manifest(zed_overlay, missing_overlay, tmp_path):
     assert "codex_worker_contract_hook" in _command_for("SubagentStart")
     assert "codex_worker_contract_hook" in _command_for("PreToolUse")
 
-    # --- SubagentStart: worker roles get the numbered contract (Registry-derived) ---
+    # --- SubagentStart: worker roles get the Codex contract (Registry-derived) ---
+    # The Codex shim passes host `codex`, so the injected text is WORKER_CONTRACT_CODEX —
+    # duties 1–4 with NO SendMessage item (the Codex parent pulls the report; ADR 0007
+    # amended 2026-08-18). Names carry the canonical `chinamaxm-<profile>-` prefix.
     subagent_cmd = _command_for("SubagentStart")
-    for agent_type in ("deepseek", "deepseek-1", "zed-1"):
+    for agent_type in ("deepseek", "chinamaxm-deepseek-repo-summary", "chinamaxm-zed-x"):
         result = _run(subagent_cmd, _subagent_event(agent_type), overlay_path=zed_overlay)
         assert result.returncode == 0, result.stderr
         out = _injected(result)
         assert out["hookEventName"] == "SubagentStart"
-        assert out["additionalContext"] == WORKER_CONTRACT
+        assert out["additionalContext"] == WORKER_CONTRACT_CODEX
         for number in ("1.", "2.", "3.", "4."):
             assert number in out["additionalContext"]
+        # No push item on Codex — the parent pulls the report from the rollout.
+        assert "5." not in out["additionalContext"]
+        assert "SendMessage" not in out["additionalContext"]
 
-    # Anchored-match trap (`kimono` vs profile `kimi`) and a non-worker role ⇒ silent.
-    for agent_type in ("kimono", "Explore"):
+    # Silent cases: anchored trap (`kimono` vs profile `kimi`), a built-in role, the RETIRED
+    # legacy instance form (`deepseek-1`), and the anchored trap on the new prefix.
+    for agent_type in ("kimono", "Explore", "deepseek-1", "chinamaxm-kimono-x"):
         result = _run(subagent_cmd, _subagent_event(agent_type), overlay_path=missing_overlay)
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "", result.stdout
@@ -253,6 +260,29 @@ def test_contract_in_codex_manifest(zed_overlay, missing_overlay, tmp_path):
     assert result.returncode == 0
     assert result.stdout.strip() == "", result.stdout
     assert result.stderr.strip() != ""
+
+
+# --------------------------------------------------------- test 2b (collect = pull)
+
+
+def test_codex_collect_report_is_pull():
+    """AC (delivery, ADR 0007 amended 2026-08-18): the Codex parent PULLS the Worker's final
+    report from the child rollout and NEVER asks it to restate.
+
+    Codex children cannot push (PR #27173), so — unlike the Claude push directive locked by
+    ``test_task_command_text_invariants`` — the skill must tell the parent where to read the
+    report and forbid a token-spending, paraphrase-risking restatement.
+    """
+    flat = _flat(SKILL_FILE.read_text(encoding="utf-8"))
+
+    # The pull section names the rollout as the source of the final message.
+    assert "Collect the report" in flat
+    assert "rollout JSONL" in flat
+    assert "$CODEX_HOME/sessions/" in flat
+
+    # The restate-via-followup_task ban protects the verbatim guarantee.
+    assert "followup_task" in flat
+    assert "restate its report" in flat
 
 
 # ------------------------------------------------------------------ test 3 (steering)
@@ -315,9 +345,9 @@ def test_surface_symmetry_with_claude():
         assert "verbatim as the Worker's error" in _flat(text)
         # The shared rewrite helper via the Launcher (host token differs per surface).
         assert '/scripts/chinamaxM" set_model' in text
-        # Default and custom name rules.
-        assert "<profile>-<n>" in text
-        assert "<profile>-" in text
+        # Default and custom name rules — the canonical `chinamaxm-<profile>-` grammar.
+        assert "chinamaxm-<profile>-<n>" in text
+        assert "chinamaxm-<profile>-" in text
         assert "non-empty suffix" in lower
         # The verbatim Relay rule, identical on both.
         assert RELAY_RULE in text

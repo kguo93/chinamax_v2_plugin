@@ -5,12 +5,17 @@ One module serves two pinned Claude events (ADR 0005/0007), branching on the std
 exit 0:
 
 * **SubagentStart** (worker-side): its ``additionalContext`` is delivered to the spawned
-  Worker. When the top-level ``agent_type`` names a generated Worker, inject
-  :data:`WORKER_CONTRACT` — the numbered final-report duty.
+  Worker. When the top-level ``agent_type`` names a generated Worker, inject the Host's
+  numbered final-report contract — :data:`WORKER_CONTRACT_CLAUDE`, whose item 5 has the
+  Worker push its final report to ``main`` via SendMessage, or, on Codex,
+  :data:`WORKER_CONTRACT_CODEX`, which omits that push item because the Codex parent PULLS
+  the final message from the child rollout instead (ADR 0007 as amended 2026-08-18). The
+  Host is selected by the first CLI argument each shim passes (``claude`` / ``codex``;
+  default ``claude``).
 * **PreToolUse** on the Agent tool (parent-side): fires in the dispatching parent's turn
   on the spawn call. When ``tool_input.subagent_type`` names a generated Worker, inject
   :data:`RELAY_RULE` — the verbatim, no-attribution Relay rule (the same string the
-  ``/chinamaxM:task`` command carries as its operative first copy).
+  ``/chinamaxM:task`` command carries as its operative first copy). Host-independent.
 
 Matching is anchored and Registry-derived via the single shared
 :func:`chinamaxM.generate.matches_generated_agent` seam (never re-implemented here). The
@@ -30,11 +35,13 @@ from pathlib import Path
 from chinamaxM.generate import matches_generated_agent
 from chinamaxM.registry import load_registry
 
-#: The numbered, token-lean Worker contract injected into a spawned Worker at
+#: The numbered, token-lean Worker contract injected into a spawned Codex Worker at
 #: SubagentStart. This enumerated text IS the canonical contract (ADR 0007): the Worker
 #: ends with one complete final report, and its final message alone is what the parent
-#: Relays verbatim.
-WORKER_CONTRACT = (
+#: Relays verbatim. Codex children cannot push to the parent (PR #27173), so there is no
+#: SendMessage item — the Codex parent PULLS this final message from the child rollout
+#: (ADR 0007 as amended 2026-08-18).
+WORKER_CONTRACT_CODEX = (
     "chinamaxM Worker contract:\n"
     "1. Do the task the parent gave you — nothing more, nothing less.\n"
     "2. End with ONE complete, self-contained final report as your last message: what "
@@ -42,6 +49,17 @@ WORKER_CONTRACT = (
     "3. Never end with a question unless you are genuinely blocked and cannot proceed.\n"
     "4. Your final message IS the deliverable — the parent prints it verbatim, so it "
     "must stand alone."
+)
+
+#: The Claude Worker contract: the same four duties plus item 5, the delivery duty. A
+#: Claude Worker is a named background subagent that CAN message its parent, so it must
+#: actively push its final report to ``main`` rather than trust the parent to notice its
+#: thread — the exact failure that made a dispatched Worker report only into its own thread
+#: (ADR 0007 as amended 2026-08-18).
+WORKER_CONTRACT_CLAUDE = (
+    WORKER_CONTRACT_CODEX
+    + "\n5. Deliver that final report by SendMessage to 'main', with the report in the "
+    "message body — never assume main saw your thread."
 )
 
 #: The one canonical Relay rule injected into the dispatching parent at
@@ -84,13 +102,23 @@ def _emit(event_name: str, context: str) -> None:
     )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Read one hook event from stdin, inject when it matches, and always exit 0.
+
+    Args:
+        argv: The post-program arguments (defaults to ``sys.argv[1:]``). ``argv[0]``
+            selects the Host contract for SubagentStart: ``"codex"`` injects
+            :data:`WORKER_CONTRACT_CODEX`; anything else (including an absent value)
+            injects :data:`WORKER_CONTRACT_CLAUDE`, the safe default. The Relay rule is
+            Host-independent.
 
     Returns:
         ``0`` unconditionally. A non-matching event injects nothing; any internal fault
         emits a stderr diagnostic and still returns 0 (fail-open).
     """
+    args = sys.argv[1:] if argv is None else argv
+    host = args[0] if args else "claude"
+    contract = WORKER_CONTRACT_CODEX if host == "codex" else WORKER_CONTRACT_CLAUDE
     try:
         event = json.load(sys.stdin)
         if not isinstance(event, dict):
@@ -102,7 +130,7 @@ def main() -> int:
             if isinstance(agent_type, str) and matches_generated_agent(
                 agent_type, _profile_names()
             ):
-                _emit("SubagentStart", WORKER_CONTRACT)
+                _emit("SubagentStart", contract)
         elif event_name == "PreToolUse":
             if event.get("tool_name") != "Agent":
                 return 0

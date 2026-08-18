@@ -106,3 +106,15 @@ hardcoded `python3 -m …` (setup), `conda run -n chinamaxM python -m …` (doct
 `Bash` to `Bash(${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM:*)`. The interpreter-rung mechanics (the
 shared `scripts/_interpreter.sh` discovery order, the macOS operator kick-back, the Windows
 zero-state re-run) live in ADR 0009 (as amended 2026-08-14), which this cross-references.
+
+**Amended 2026-08-18 (Worker instance-name grammar — cross-ref ADR 0004 as amended
+2026-08-18).** Two naming sentences here are superseded. The original `/task` bullet read
+"Spawns the matching Generated agent as a **named background subagent** (default name
+`<profile>-<n>`)", and the 2026-08-13 amendment read "A custom `name=` must be `<profile>-`
+plus a NON-EMPTY suffix, both hosts." **Reversed**: the default name is now
+`chinamaxm-<profile>-<task-slug>` (numeric `chinamaxm-<profile>-<n>` fallback), and a custom
+`name=` must be `chinamaxm-<profile>-` plus a non-empty lowercase `[a-z0-9-]` suffix, both
+Hosts. The symmetric-surface guarantee is unchanged — both task surfaces carry the identical
+grammar; only the grammar itself moved. See ADR 0004 (as amended 2026-08-18) for the matcher
+and rationale, and ADR 0007 (as amended 2026-08-18) for the report-delivery duty added to the
+same surfaces in this pass.

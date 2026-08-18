@@ -52,12 +52,19 @@ authority.
 Spawn the role via `spawn_agent`, selecting the agent by the role name `<profile>` (the
 bare Profile generated role — the ONLY artifact) and giving it an instance `name`:
 
-- Default `name` is `<profile>-<n>`, where `<n>` is the lowest positive integer not
-  already in use this session, counting BOTH running and completed Workers as occupied
-  (completed Workers stay addressable).
-- A custom `name=` MUST be `<profile>-` followed by a NON-EMPTY suffix, charset lowercase
-  `[a-z0-9-]`; a duplicate custom name is an error. (A named spawn surfaces the NAME, not
-  the role type, to the contract hook — so the name must stay anchored to the Profile.)
+- Default `name` is `chinamaxm-<profile>-<task-slug>`, where `<task-slug>` is a short
+  lowercase kebab slug (2–4 words) you derive from the prompt, so the name references
+  chinamaxM and the task rather than a bare index (e.g.
+  `chinamaxm-deepseek-repo-summary`). If that exact name is already in use this session —
+  counting BOTH running and completed Workers as occupied (completed Workers stay
+  addressable) — append `-2`, `-3`, … until it is free. If the prompt yields no sensible
+  slug, fall back to `chinamaxm-<profile>-<n>`, where `<n>` is the lowest positive integer
+  not already in use this session (same running-and-completed occupancy rule).
+- A custom `name=` MUST be `chinamaxm-<profile>-` followed by a NON-EMPTY suffix, charset
+  lowercase `[a-z0-9-]`; a duplicate custom name is an error. (A named spawn surfaces the
+  NAME, not the role type, to the contract hook, and the hook matches on the
+  `chinamaxm-<profile>-` prefix — so the name must carry it or the Worker contract never
+  fires.)
 
 For a headless dispatch, close stdin by appending `< /dev/null`: `codex exec` blocks on an
 open pipeline stdin, so the redirect lets the run proceed unattended. On Windows the
@@ -68,6 +75,16 @@ The model half is structural — routing rides the generated role's `model_provi
 `model` line you just rewrote (ADR 0004/0005), and a spawn-time model would hijack it. The
 reasoning-effort half is excluded from generated Worker roles by design. The spawn call
 carries neither.
+
+## Collect the report
+
+A Codex child cannot push a message to its parent (`send_input` is parent→child only, PR
+#27173), so the Worker's final report will NOT arrive on its own — you PULL it. When the
+Worker completes, read its final message from the child rollout JSONL under
+`$CODEX_HOME/sessions/` (the ADR 0007 audit trail): match the child by its thread id, and
+check `session_meta` / `forked_from_id` when disambiguating children. That final message is
+what you relay next. NEVER `followup_task` the Worker to restate its report — that spends
+provider tokens and risks a paraphrase that breaks the verbatim guarantee.
 
 ## Relay the result
 

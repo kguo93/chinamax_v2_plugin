@@ -62,6 +62,14 @@ _YAML_WIDTH = 1 << 30
 #: and URL-path surfaces (ADR 0004 as amended) — lowercase alphanumerics and ``-`` only.
 _NAME_GRAMMAR = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
+#: Prefix for an operator-facing Worker INSTANCE name (the spawn ``name``), distinct from
+#: the generated artifact name (the bare Profile) and from :data:`PROVIDER_PREFIX` (the
+#: Codex provider ID, capital-M). A named Worker spawn is ``chinamaxm-<profile>-<suffix>``
+#: with a non-empty lowercase ``[a-z0-9-]`` suffix, so the name references chinamaxM and the
+#: task rather than a bare Profile index (ADR 0004 as amended 2026-08-18). Lowercase to
+#: satisfy the shared name grammar on both Hosts.
+WORKER_NAME_PREFIX = "chinamaxm-"
+
 #: Reserved Profile names on either Host, matched case-insensitively (ADR 0004 as
 #: amended): built-in Claude Code agents plus the reserved Codex provider IDs. Checked in
 #: preflight as defense in depth beyond the Registry loader.
@@ -83,7 +91,9 @@ _RESERVED_PROFILE_NAMES = frozenset(
 
 #: The lean Worker system prompt, authored once here and used verbatim as both the Claude
 #: agent body and the Codex role ``developer_instructions`` (ADR 0004 as amended). Numbered
-#: and token-lean; item 4 states the complete-final-report duty hosts-02's hooks enforce.
+#: and token-lean; item 4 states the complete-final-report duty hosts-02's hooks enforce,
+#: and item 5 points a Worker at its Host's lazy-loaded MCP tools (ADR 0004 as amended
+#: 2026-08-16) — a non-Claude model does not otherwise know to look for a deferred schema.
 WORKER_INSTRUCTIONS = (
     "1. You are a chinamaxM worker subagent. Do exactly the task the parent gives "
     "you — nothing more, nothing less.\n"
@@ -94,7 +104,11 @@ WORKER_INSTRUCTIONS = (
     "4. End with ONE complete, self-contained final report as your last message: what "
     "you did, the outcome, and every path or result the parent needs. The parent "
     "prints this message verbatim as its own, so it must stand alone — nothing you "
-    "said earlier is relayed."
+    "said earlier is relayed.\n"
+    "5. Your Host has MCP tools, and their schemas load on demand — a tool absent from "
+    "your context is NOT absent from your Host. Prefer them over reinventing the same "
+    "work by hand, and look one up only when the task needs it: ToolSearch on Claude, "
+    "ALL_TOOLS / tools.mcp__<server>__<tool> in the exec sandbox on Codex."
 )
 
 
@@ -270,29 +284,33 @@ def matches_generated_agent(name: str, profile_names: Iterable[str]) -> bool:
     """Return whether ``name`` addresses a generated Worker for some Profile.
 
     A generated Worker is spawned either as the bare Profile agent (its ``agent_type`` is
-    the Profile name) or under an operator-chosen name ``<profile>-<suffix>`` with a
-    non-empty suffix (a named spawn surfaces the NAME, not the subagent type — ADR 0004 as
-    amended). This is the single shared matcher the worker-contract hook reuses on both its
-    SubagentStart (``agent_type``) and PreToolUse (``subagent_type``) branches, so the rule
-    is never re-implemented inline.
+    the Profile name) or under an operator-chosen INSTANCE name
+    ``chinamaxm-<profile>-<suffix>`` with a non-empty suffix (a named spawn surfaces the
+    NAME, not the subagent type — ADR 0004 as amended 2026-08-18). This is the single shared
+    matcher the worker-contract hook reuses on both its SubagentStart (``agent_type``) and
+    PreToolUse (``subagent_type``) branches, so the rule is never re-implemented inline.
 
-    Matching is anchored and case-sensitive: a bare substring would misfire (``glm`` inside
-    ``glmax``, ``kimi`` inside ``akimi``). Reserved Profile names cannot enter the Registry
-    (ADR 0003/0004 as amended), so a built-in agent name can never match. An unrelated
-    agent whose name merely starts ``<profile>-`` gets the benign contract — the accepted
-    false-positive direction.
+    Matching is anchored and case-sensitive: the ``chinamaxm-<profile>-`` prefix must match
+    exactly, so ``chinamaxm-kimono-x`` never matches Profile ``kimi`` and a bare-substring
+    misfire is impossible. The legacy ``<profile>-<suffix>`` instance form (e.g.
+    ``deepseek-1``) is NOT matched — the canonical grammar now carries the ``chinamaxm-``
+    prefix (ADR 0004 as amended 2026-08-18). Reserved Profile names cannot enter the
+    Registry (ADR 0003/0004), so a built-in agent name can never match. An unrelated agent
+    whose name merely starts ``chinamaxm-<profile>-`` gets the benign contract — the
+    accepted false-positive direction.
 
     Args:
         name: The candidate ``agent_type`` or ``subagent_type`` from a hook event.
         profile_names: The resolved Registry's Profile names.
 
     Returns:
-        ``True`` when ``name`` equals a Profile name or ``<profile>-<non-empty suffix>``.
+        ``True`` when ``name`` equals a Profile name or
+        ``chinamaxm-<profile>-<non-empty suffix>``.
     """
     for profile in profile_names:
         if name == profile:
             return True
-        prefix = f"{profile}-"
+        prefix = f"{WORKER_NAME_PREFIX}{profile}-"
         if name.startswith(prefix) and len(name) > len(prefix):
             return True
     return False

@@ -27,6 +27,9 @@
 set -uo pipefail
 
 MODULE="chinamaxM.hooks.worker_contract"
+# Host token: selects the Codex Worker contract (no SendMessage push item — the Codex parent
+# PULLS the final message from the child rollout instead; ADR 0007 as amended 2026-08-18).
+HOST="codex"
 payload="$(cat)"
 
 # A stdlib-only translator: read the Codex payload on stdin, remap the PreToolUse fields,
@@ -54,7 +57,7 @@ CHINAMAXM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 . "${CHINAMAXM_SCRIPT_DIR}/_interpreter.sh"
 
 if py="$(chinamaxm_resolve_python)"; then
-  printf '%s' "${payload}" | "${py}" -c "${TRANSLATE}" | "${py}" -m "${MODULE}"
+  printf '%s' "${payload}" | "${py}" -c "${TRANSLATE}" | "${py}" -m "${MODULE}" "${HOST}"
   exit 0
 fi
 
@@ -64,7 +67,7 @@ if [ -n "${conda_cmd}" ]; then
   # read an empty payload. It connects stdio directly instead.
   printf '%s' "${payload}" \
     | "${conda_cmd}" run --no-capture-output -n chinamaxM python -c "${TRANSLATE}" \
-    | "${conda_cmd}" run --no-capture-output -n chinamaxM python -m "${MODULE}"
+    | "${conda_cmd}" run --no-capture-output -n chinamaxM python -m "${MODULE}" "${HOST}"
   exit 0
 fi
 

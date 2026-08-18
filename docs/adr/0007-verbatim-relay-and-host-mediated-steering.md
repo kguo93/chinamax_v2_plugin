@@ -34,3 +34,28 @@ Additionally, per the 2026-08-13 grilling: a provider-side error inside a Worker
 (unknown model string included) is a FINAL REPORT for relay purposes — the parent
 surfaces the provider's error verbatim to the operator/main session, never swallows or
 rewrites it (cross-ref ADR 0001's unrewritten error relay).
+
+**Amended 2026-08-18 (report DELIVERY is a Host-specific asymmetry inside the symmetric
+Relay surface — push on Claude, pull on Codex).** The verbatim-Relay rule above governs how
+the parent PRINTS a report; it never said how the report REACHES the parent, and a dispatched
+Claude Worker was observed ending its turn with the report sitting only in its own subagent
+thread, never delivered to `main`. Delivery is now pinned, and it differs by Host exactly as
+steering does:
+
+- **Claude (push).** The hook-injected `WORKER_CONTRACT_CLAUDE` gains item 5: the Worker
+  delivers its final report by `SendMessage` to `main`, the report in the message body, never
+  assuming main saw its thread. `commands/task.md` additionally has the dispatching parent
+  append the same directive to the Worker's spawn prompt — the same canonical-string-plus-
+  command-copy pattern the Relay rule already uses.
+- **Codex (pull).** A Codex child cannot push to its parent (PR #27173, the same constraint
+  behind the steering asymmetry), and Codex 0.147.0 exposes no wait/collect tool. So
+  `WORKER_CONTRACT_CODEX` keeps the four shared duties with NO push item, and
+  `skills/chinamaxM-task/SKILL.md` instructs the parent to PULL the Worker's final message
+  from the child rollout JSONL under `$CODEX_HOME/sessions/` (this ADR's audit trail) and
+  Relay it. Restating the report via `followup_task` is banned — it spends provider tokens
+  and risks a paraphrase that breaks the verbatim guarantee.
+
+The contract is selected by a Host token each shim passes to the shared
+`worker_contract.py` module (`claude` / `codex`, default `claude`). The Relay rule itself
+stays Host-independent and byte-identical on both surfaces. Cross-ref ADR 0004/0005 (as
+amended 2026-08-18) for the Worker instance-name grammar changed in the same pass.

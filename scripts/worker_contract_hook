@@ -17,6 +17,9 @@
 set -uo pipefail
 
 MODULE="chinamaxM.hooks.worker_contract"
+# Host token: selects the Claude Worker contract (item 5 pushes the final report to main
+# via SendMessage — ADR 0007 as amended 2026-08-18). The module defaults to claude anyway.
+HOST="claude"
 payload="$(cat)"
 
 CHINAMAXM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -24,7 +27,7 @@ CHINAMAXM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 . "${CHINAMAXM_SCRIPT_DIR}/_interpreter.sh"
 
 if py="$(chinamaxm_resolve_python)"; then
-  printf '%s' "${payload}" | "${py}" -m "${MODULE}"
+  printf '%s' "${payload}" | "${py}" -m "${MODULE}" "${HOST}"
   exit 0
 fi
 
@@ -32,7 +35,7 @@ conda_cmd="$(chinamaxm_conda_cmd || true)"
 if [ -n "${conda_cmd}" ]; then
   # `--no-capture-output` is REQUIRED: plain `conda run` swallows stdin, so the module
   # would read an empty event and inject nothing. It connects stdio directly instead.
-  printf '%s' "${payload}" | "${conda_cmd}" run --no-capture-output -n chinamaxM python -m "${MODULE}"
+  printf '%s' "${payload}" | "${conda_cmd}" run --no-capture-output -n chinamaxM python -m "${MODULE}" "${HOST}"
   exit 0
 fi
 

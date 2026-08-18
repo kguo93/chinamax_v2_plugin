@@ -19,7 +19,11 @@ from pathlib import Path
 
 import pytest
 
-from chinamaxM.hooks.worker_contract import RELAY_RULE, WORKER_CONTRACT
+from chinamaxM.hooks.worker_contract import (
+    RELAY_RULE,
+    WORKER_CONTRACT_CLAUDE,
+    WORKER_CONTRACT_CODEX,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS_JSON = REPO_ROOT / "hooks" / "hooks.json"
@@ -138,10 +142,15 @@ def test_task_command_text_invariants():
     assert '"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" set_model claude <profile> <model>' in text
     assert "verbatim as the Worker's error" in text
 
-    # Named background spawn: default `<profile>-<n>`; custom name `<profile>-` + non-empty.
-    assert "<profile>-<n>" in text
-    assert "<profile>-" in text
+    # Named background spawn: default slug name, numeric fallback, and the custom-name
+    # grammar — all carrying the canonical `chinamaxm-<profile>-` prefix (ADR 0004 amended).
+    assert "chinamaxm-<profile>-<task-slug>" in text
+    assert "chinamaxm-<profile>-<n>" in text
+    assert "chinamaxm-<profile>-" in text
     assert "non-empty suffix" in lower
+
+    # The delivery directive: the parent tells the Worker to push its final report to main.
+    assert "SendMessage to `main` with your complete final report" in text
 
     # No spawn-time model param, with the enum-lock + resolution-order reason.
     assert "never pass a" in lower
@@ -160,29 +169,40 @@ def test_task_command_text_invariants():
 
 
 def test_contract_hook_injects_on_worker_spawn(zed_overlay):
-    """AC-2 (LIVE): SubagentStart injects the numbered contract for generated Workers."""
+    """AC-2 (LIVE): SubagentStart injects the Claude contract for generated Workers.
+
+    The Claude shim passes host ``claude``, so the injected text is
+    :data:`WORKER_CONTRACT_CLAUDE` — the four shared duties plus item 5 (push the final
+    report to main). Names carry the canonical ``chinamaxm-<profile>-`` prefix; the bare
+    Profile ``deepseek`` is the subagent-type spawn.
+    """
     command = _command_for("SubagentStart")
-    for agent_type in ("deepseek", "deepseek-1", "zed-1"):
+    for agent_type in ("deepseek", "chinamaxm-deepseek-repo-summary", "chinamaxm-zed-x"):
         event = {"hook_event_name": "SubagentStart", "agent_id": "x", "agent_type": agent_type}
         result = _run(command, json.dumps(event), overlay_path=zed_overlay)
         assert result.returncode == 0, result.stderr
         out = _injected(result)
         assert out["hookEventName"] == "SubagentStart"
         context = out["additionalContext"]
-        assert context == WORKER_CONTRACT
-        for number in ("1.", "2.", "3.", "4."):
+        assert context == WORKER_CONTRACT_CLAUDE
+        for number in ("1.", "2.", "3.", "4.", "5."):
             assert number in context
+        assert "SendMessage to 'main'" in context
 
 
 # -------------------------------------------------------------- test 3 (non-workers)
 
 
 def test_contract_hook_ignores_non_workers(missing_overlay):
-    """AC-2 (LIVE): non-Worker SubagentStart events inject nothing (anchored matching)."""
+    """AC-2 (LIVE): non-Worker SubagentStart events inject nothing (anchored matching).
+
+    ``Explore`` is a built-in; ``glmax``/``akimi`` are bare-substring traps; ``deepseek-1``
+    is the RETIRED legacy instance form, now unmatched because the canonical grammar carries
+    the ``chinamaxm-`` prefix (ADR 0004 amended 2026-08-18); ``chinamaxm-glmax-x`` is the
+    anchored trap on the new prefix (profile ``glm`` but not ``chinamaxm-glm-``).
+    """
     command = _command_for("SubagentStart")
-    # Explore is a built-in; `glmax` starts with profile `glm` but not `glm-`; `akimi`
-    # contains `kimi` but is not `kimi-` prefixed — all discriminate anchored from substring.
-    for agent_type in ("Explore", "glmax", "akimi"):
+    for agent_type in ("Explore", "glmax", "akimi", "deepseek-1", "chinamaxm-glmax-x"):
         event = {"hook_event_name": "SubagentStart", "agent_id": "x", "agent_type": agent_type}
         result = _run(command, json.dumps(event), overlay_path=missing_overlay)
         assert result.returncode == 0, result.stderr
@@ -199,7 +219,11 @@ def test_relay_rule_injected_at_spawn(missing_overlay):
     worker = {
         "hook_event_name": "PreToolUse",
         "tool_name": "Agent",
-        "tool_input": {"subagent_type": "deepseek", "name": "deepseek-1", "prompt": "x"},
+        "tool_input": {
+            "subagent_type": "deepseek",
+            "name": "chinamaxm-deepseek-review",
+            "prompt": "x",
+        },
     }
     result = _run(command, json.dumps(worker), overlay_path=missing_overlay)
     assert result.returncode == 0, result.stderr
@@ -236,10 +260,18 @@ def test_relay_rule_injected_at_spawn(missing_overlay):
 
 
 def test_contract_token_lean():
-    """AC-4: the injected contract is ≤ 120 words with every rule numbered."""
-    numbers = re.findall(r"(?m)^(\d+)\.", WORKER_CONTRACT)
-    assert numbers == ["1", "2", "3", "4"]
-    assert len(WORKER_CONTRACT.split()) <= 120
+    """AC-4: both injected contracts are ≤ 120 words with every rule numbered.
+
+    The Codex contract carries duties 1–4; the Claude contract is that same text plus item 5
+    (push the final report to main) — the sole Host difference (ADR 0007 amended 2026-08-18).
+    """
+    codex_numbers = re.findall(r"(?m)^(\d+)\.", WORKER_CONTRACT_CODEX)
+    assert codex_numbers == ["1", "2", "3", "4"]
+    claude_numbers = re.findall(r"(?m)^(\d+)\.", WORKER_CONTRACT_CLAUDE)
+    assert claude_numbers == ["1", "2", "3", "4", "5"]
+    assert WORKER_CONTRACT_CLAUDE.startswith(WORKER_CONTRACT_CODEX)
+    assert len(WORKER_CONTRACT_CODEX.split()) <= 120
+    assert len(WORKER_CONTRACT_CLAUDE.split()) <= 120
 
 
 # ------------------------------------------------------------------- test 6 (steering)

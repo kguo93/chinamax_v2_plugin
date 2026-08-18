@@ -31,10 +31,10 @@ skill with the same name and arguments, just without the leading slash:
 
 | Claude Code | Codex |
 |---|---|
-| `/chinamaxM:setup` | `chinamaxM-setup` skill |
-| `/chinamaxM:task` | `chinamaxM-task` skill |
-| `/chinamaxM:doctor` | `chinamaxM-doctor` skill |
-| `/chinamaxM:profiles` | `chinamaxM-profiles` skill |
+| `/chinamaxm:setup` | `chinamaxM-setup` skill |
+| `/chinamaxm:task` | `chinamaxM-task` skill |
+| `/chinamaxm:doctor` | `chinamaxM-doctor` skill |
+| `/chinamaxm:profiles` | `chinamaxM-profiles` skill |
 
 The rest of this README uses the Claude Code form.
 
@@ -59,7 +59,7 @@ codex plugin add chinamaxm@chinamaxm-plugin
 
 ## 2. Run setup
 
-Installing only adds the commands. `/chinamaxM:setup` wires everything up. It is the only
+Installing only adds the commands. `/chinamaxm:setup` wires everything up. It is the only
 command that changes your machine, and it changes **nothing** until you approve.
 
 **Prerequisites first.** If a platform tool is missing (`bash`, Miniconda, or — on Windows —
@@ -102,7 +102,7 @@ DEEPSEEK_API_KEY=...
 GLM_API_KEY=...
 ```
 
-Only fill in the models you will actually use. `/chinamaxM:profiles` shows which keys are
+Only fill in the models you will actually use. `/chinamaxm:profiles` shows which keys are
 present (PRESENT/MISSING — never the value).
 
 ## How the proxy stays alive (per OS)
@@ -126,7 +126,7 @@ Dispatch a task to a worker. It runs as a **named background subagent**; when it
 its report is printed straight back to you.
 
 ```
-/chinamaxM:task profile=deepseek <your prompt>
+/chinamaxm:task profile=deepseek <your prompt>
 ```
 
 Arguments:
@@ -135,13 +135,14 @@ Arguments:
 - `model=<any string>` — optional. Overrides the profile's default model. The string goes
   straight to the provider and is never checked, so a typo comes back as the provider's own
   error.
-- `name=<worker>` — optional. Must start with `<profile>-` (e.g. `deepseek-review`).
-  Defaults to `deepseek-1`, `deepseek-2`, …
+- `name=<worker>` — optional. Must be `chinamaxm-<profile>-<suffix>` (e.g.
+  `chinamaxm-deepseek-review`). Defaults to a task-descriptive name derived from your
+  prompt, like `chinamaxm-deepseek-repo-summary`.
 
 Examples:
 ```
-/chinamaxM:task profile=deepseek summarize the diff on this branch
-/chinamaxM:task profile=glm model=glm-4-plus name=glm-tests write tests for utils.py
+/chinamaxm:task profile=deepseek summarize the diff on this branch
+/chinamaxm:task profile=glm model=glm-4-plus name=chinamaxm-glm-tests write tests for utils.py
 ```
 
 ## Steer and continue a worker
@@ -149,9 +150,9 @@ Examples:
 While the session that launched it is alive, a worker stays addressable by its name. Just
 tell the host in plain language:
 
-- Mid-run: "tell deepseek-1 to also cover the error paths."
-- After it finishes: "ask deepseek-1 to now write the tests" — it picks up with full
-  context.
+- Mid-run: "tell chinamaxm-deepseek-repo-summary to also cover the error paths."
+- After it finishes: "ask chinamaxm-deepseek-repo-summary to now write the tests" — it
+  picks up with full context.
 
 Same experience on both hosts. (On Codex the host relays your message to the worker behind
 the scenes, because Codex won't let you message a child directly — you don't have to think
@@ -164,10 +165,10 @@ that session ends, the worker is gone — dispatch a fresh one from the new sess
 
 ## Check the install
 
-- `/chinamaxM:doctor` — checks everything read-only and free: conda env, dependencies,
+- `/chinamaxm:doctor` — checks everything read-only and free: conda env, dependencies,
   service running, port live. Never spends tokens. If it can't even launch (no conda, no
   env), that failure *is* the diagnosis — run setup.
-- `/chinamaxM:profiles` — lists each model, its default, and which keys are set.
+- `/chinamaxm:profiles` — lists each model, its default, and which keys are set.
 
 ## Upgrade
 
@@ -184,6 +185,6 @@ codex plugin add chinamaxm@chinamaxm-plugin
 
 ## Uninstall / teardown
 
-Run `/chinamaxM:setup` and choose teardown. It removes the `ANTHROPIC_BASE_URL` flip and
+Run `/chinamaxm:setup` and choose teardown. It removes the `ANTHROPIC_BASE_URL` flip and
 the proxy service; it leaves your keys, generated agents, and Linux linger in place. Like
 setup, it shows a plan and waits for your approval before touching anything.
