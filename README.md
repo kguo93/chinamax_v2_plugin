@@ -156,6 +156,9 @@ Examples:
 /chinamaxm:task profile=glm model=glm-4-plus name=chinamaxm-glm-tests write tests for utils.py
 ```
 
+Alternatively in Claude Code: use "/model" command with "<profile>/<model-string>" to set the main thread model
+Example: "/model deepseek/deepseek-v4-pro[1m]" This is not supported inside Codex.
+
 ## Steer and continue a worker
 
 While the session that launched it is alive, a worker stays addressable by its name. Just
