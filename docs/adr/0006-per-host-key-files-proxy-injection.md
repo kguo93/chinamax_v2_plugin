@@ -47,3 +47,27 @@ O_EXCL comments-only scaffolding (a v1-populated file is never clobbered — the
 SKIPs when the file exists), the Proxy remains the only reader of key VALUES and still
 loads whichever of the two files exist, choosing by the request's ingress Host, and
 doctor/`/profiles` PRESENT/MISSING reporting is now per-invoking-Host (ADR 0005).
+
+**Amended 2026-08-18 (per-OS root pinning — clarification only, no behavior change).**
+A grilling questioned whether the canonical chain lands wrong on Windows/macOS (suspecting
+OS-native app-data dirs). Verified against the hosts' official docs: **both Hosts keep
+their app data in a home dotfolder on every OS** — neither uses the OS-native app-data
+convention — so the chain above is confirmed correct and is now pinned per OS and Host:
+
+| OS | Claude root (`~/.claude`) | Codex root (`~/.codex`) |
+|---|---|---|
+| Linux | `/home/<name>/.claude` | `/home/<name>/.codex` |
+| macOS | `/Users/<name>/.claude` | `/Users/<name>/.codex` |
+| Windows (native) | `%USERPROFILE%\.claude` | `%USERPROFILE%\.codex` |
+
+- Explicitly **NOT** `%APPDATA%\Claude` and **NOT** `~/Library/Application Support/Claude`
+  — those belong to Claude Desktop, a different product that never reads these Key files.
+- WSL and native Windows are separate installs with separate homes; each resolves its own
+  root through the same chain (`expanduser` in the running interpreter picks that
+  platform's home, so the Key file always scaffolds where the invoking Host's app data
+  actually lives).
+- The hosts' own relocation variables remain the chain's third rung
+  (`$CLAUDE_CONFIG_DIR` / `$CODEX_HOME`), so a deliberately moved host install is followed
+  automatically on any OS.
+- Evidence: code.claude.com/docs/en/claude-directory;
+  developers.openai.com/codex/config-basic.

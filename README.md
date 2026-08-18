@@ -101,8 +101,12 @@ Each worker needs its provider's key. Setup creates a per-host key file with the
 commented out; you fill in the values. The file is never committed, and the proxy is the
 only thing that reads it.
 
-- Claude Code: `~/.claude/model-keys.env`
-- Codex: `~/.codex/model-keys.env`
+- Claude Code: `~/.claude/model-keys.env` (Windows: `%USERPROFILE%\.claude\model-keys.env`)
+- Codex: `~/.codex/model-keys.env` (Windows: `%USERPROFILE%\.codex\model-keys.env`)
+
+Both hosts use these home dotfolders on **every** OS — macOS included (not
+`~/Library/Application Support`; `%APPDATA%\Claude` is Claude Desktop, not Claude Code).
+If you relocated a host with `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, the key file follows it.
 
 ```
 DEEPSEEK_API_KEY=...
