@@ -1,6 +1,6 @@
 {
   "name": "chinamaxm",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Expose non-Claude worker models as native subagents of Claude Code and Codex, routed through one local Proxy.",
   "homepage": "https://github.com/kguo93/chinamax_v2_plugin",
   "repository": "https://github.com/kguo93/chinamax_v2_plugin",

@@ -59,3 +59,11 @@ The contract is selected by a Host token each shim passes to the shared
 `worker_contract.py` module (`claude` / `codex`, default `claude`). The Relay rule itself
 stays Host-independent and byte-identical on both surfaces. Cross-ref ADR 0004/0005 (as
 amended 2026-08-18) for the Worker instance-name grammar changed in the same pass.
+
+**Amended 2026-08-19 (the contract-hook matcher accepts both per-Host name grammars —
+cross-ref ADR 0004 as amended 2026-08-19).** Codex 0.147 rejects hyphenated agent names,
+so a Codex Worker instance is `chinamaxm_<profile>_<suffix>` while Claude keeps
+`chinamaxm-<profile>-<suffix>`. The single shared matcher (`matches_generated_agent`) both
+Host hooks reuse now accepts exactly the bare `<profile>` plus BOTH full instance forms
+(one separator used throughout a name; anchored, case-sensitive, empty suffixes rejected).
+The contract-injection and Relay semantics are unchanged.

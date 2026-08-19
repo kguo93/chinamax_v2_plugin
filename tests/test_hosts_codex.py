@@ -174,9 +174,11 @@ def test_codex_skill_delegation_language():
     assert USAGE_LINE in text
     assert "no default profile" in lower
 
-    # Role selection: explicit model ⇒ the codex rewrite helper; never validated.
+    # Role selection: explicit model ⇒ the Dispatch marker in the spawn message; never
+    # validated; NO file-rewrite step of any kind (ADR 0004 as amended 2026-08-19).
     assert "never validated" in lower
-    assert '"<plugin-checkout>/scripts/chinamaxM" set_model codex <profile> <model>' in text
+    assert "[chinamaxm model=<model>]" in text
+    assert "set_model" not in text
 
     # Headless stdin-close guidance.
     assert "< /dev/null" in text
@@ -211,9 +213,16 @@ def test_contract_in_codex_manifest(zed_overlay, missing_overlay, tmp_path):
     # --- SubagentStart: worker roles get the Codex contract (Registry-derived) ---
     # The Codex shim passes host `codex`, so the injected text is WORKER_CONTRACT_CODEX —
     # duties 1–4 with NO SendMessage item (the Codex parent pulls the report; ADR 0007
-    # amended 2026-08-18). Names carry the canonical `chinamaxm-<profile>-` prefix.
+    # amended 2026-08-18). Names carry the Codex underscore grammar
+    # `chinamaxm_<profile>_<suffix>` (ADR 0004 as amended 2026-08-19); the shared matcher
+    # also still accepts the Claude hyphen form.
     subagent_cmd = _command_for("SubagentStart")
-    for agent_type in ("deepseek", "chinamaxm-deepseek-repo-summary", "chinamaxm-zed-x"):
+    for agent_type in (
+        "deepseek",
+        "chinamaxm_deepseek_repo_summary",
+        "chinamaxm_zed_x",
+        "chinamaxm-deepseek-repo-summary",
+    ):
         result = _run(subagent_cmd, _subagent_event(agent_type), overlay_path=zed_overlay)
         assert result.returncode == 0, result.stderr
         out = _injected(result)
@@ -226,8 +235,8 @@ def test_contract_in_codex_manifest(zed_overlay, missing_overlay, tmp_path):
         assert "SendMessage" not in out["additionalContext"]
 
     # Silent cases: anchored trap (`kimono` vs profile `kimi`), a built-in role, the RETIRED
-    # legacy instance form (`deepseek-1`), and the anchored trap on the new prefix.
-    for agent_type in ("kimono", "Explore", "deepseek-1", "chinamaxm-kimono-x"):
+    # legacy instance form (`deepseek-1`), and the anchored trap on both prefix charsets.
+    for agent_type in ("kimono", "Explore", "deepseek-1", "chinamaxm-kimono-x", "chinamaxm_kimono_x"):
         result = _run(subagent_cmd, _subagent_event(agent_type), overlay_path=missing_overlay)
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "", result.stdout
@@ -344,19 +353,22 @@ def test_surface_symmetry_with_claude():
         # Model never validated; provider errors relay verbatim.
         assert "never validated" in lower
         assert "verbatim as the Worker's error" in _flat(text)
-        # The shared rewrite helper via the Launcher (host token differs per surface).
-        assert '/scripts/chinamaxM" set_model' in text
-        # Default and custom name rules — the canonical `chinamaxm-<profile>-` grammar.
-        assert "chinamaxm-<profile>-<n>" in text
-        assert "chinamaxm-<profile>-" in text
+        # The shared Dispatch marker mechanism — and no rewrite step on either surface.
+        assert "[chinamaxm model=<model>]" in text
+        assert "set_model" not in text
+        # Default and custom name rules with a non-empty suffix on both surfaces.
         assert "non-empty suffix" in lower
         # The verbatim Relay rule, identical on both.
         assert RELAY_RULE in text
 
-    # The rewrite helper differs only in the host token — proving surface symmetry, not
-    # a shared host.
-    assert '"<plugin-checkout>/scripts/chinamaxM" set_model codex <profile> <model>' in skill
-    assert '"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" set_model claude <profile> <model>' in command
+    # The instance-name grammar differs only in the separator charset (ADR 0004 as amended
+    # 2026-08-19): hyphens on Claude, underscores on Codex (its agent names reject hyphens).
+    assert "chinamaxm-<profile>-<task-slug>" in command
+    assert "chinamaxm-<profile>-<n>" in command
+    assert "chinamaxm_<profile>_<task_slug>" in skill
+    assert "chinamaxm_<profile>_<n>" in skill
+    assert "chinamaxm_" not in command
+    assert "chinamaxm-<profile>-" not in skill
 
 
 # ------------------------------------------------------------- test 6 (manifest registration)

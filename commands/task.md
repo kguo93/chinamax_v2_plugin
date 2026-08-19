@@ -24,14 +24,14 @@ authority.
 
 - `model=` OMITTED ⇒ dispatch on the Profile's `default_model`, which the Generated agent
   already pins in its frontmatter. Do nothing extra.
-- `model=<any string>` GIVEN ⇒ rewrite the Generated agent's model line in place FIRST,
-  by running this via Bash, then spawn:
+- `model=<any string>` GIVEN ⇒ prepend this Dispatch marker line, followed by ONE blank
+  line, to the very top of the Worker's spawn prompt, then spawn:
 
-  `"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" set_model claude <profile> <model>`
+  `[chinamaxm model=<model>]`
 
-  This makes the agent frontmatter `model: <profile>/<model>` (the Profile prefix routes
-  on the Anthropic ingress). The rewrite→spawn window is per-dispatch and accepted;
-  SessionStart regeneration resets the line to the default.
+  The marker is the ENTIRE override mechanism — never edit any file, never run any
+  rewrite helper. The override is per-dispatch: it lives and dies with this Worker
+  instance.
 - A provider-side failure inside the Worker (an unknown model string included) is the
   Worker's final report: it relays back to you verbatim as the Worker's error — never
   swallow it, never rewrite it.
@@ -61,8 +61,8 @@ bare Profile Generated agent — the ONLY artifact) and a `name`:
 
 HARD RULE: NEVER pass a `model` param on the `Agent` spawn call. The spawn `model`
 parameter is enum-locked, and in the model-resolution order a per-spawn param would
-override the frontmatter model line you just rewrote. Routing is structural through the
-frontmatter alone; the spawn call carries no model.
+override the frontmatter model line. Routing is structural through the frontmatter (plus
+the Dispatch marker when `model=` was given); the spawn call carries no model.
 
 ## Relay the result
 

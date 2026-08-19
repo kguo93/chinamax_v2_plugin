@@ -216,25 +216,16 @@ def _finalize(request: web.Request, comp: _Completion, start: float) -> None:
         pass
 
 
-def _stripped_model(body: bytes) -> str | None:
-    """Return the forwarded model (Profile prefix stripped) from a routed request body."""
-    try:
-        payload = json.loads(body)
-    except ValueError:
-        return None
-    model = payload.get("model") if isinstance(payload, dict) else None
-    if not isinstance(model, str):
-        return None
-    return model.split("/", 1)[1] if "/" in model else model
-
-
 async def _messages_handler(request: web.Request) -> web.StreamResponse:
     """Route POST /v1/messages by Profile prefix; Anthropic matches ride the Relay branch.
 
     The body is buffered (routed paths must peek the model string); a Default match
     forwards those same bytes UNLOGGED, an Anthropic-dialect match relays, a
-    ``responses``-dialect match logs a local 501 (proxy-03). Every matched request appends
-    exactly one JSONL line, finalized in a cancellation-safe try/finally.
+    ``responses``-dialect match logs a local 501 (proxy-03). The egress body is mutated
+    exactly ONCE here, so the logged ``model`` is the EFFECTIVE egress model (Dispatch
+    marker applied — ADR 0010 as amended 2026-08-19) and always matches the sent bytes.
+    Every matched request appends exactly one JSONL line, finalized in a cancellation-safe
+    try/finally.
 
     Returns:
         The upstream passthrough, a relayed response, a local 404, a 401, or a 501 marker.
@@ -247,11 +238,12 @@ async def _messages_handler(request: web.Request) -> web.StreamResponse:
         return await _forward(request, body=body)
     if kind == "unknown":
         return _unknown_profile_response(registry)
+    egress_body = mutate_body(profile, json.loads(body))
     comp = _Completion(
         ingress="anthropic",
         profile=profile.name,
         upstream=str(relay_upstream_url(profile.base_url, "/v1/messages")),
-        model=_stripped_model(body),
+        model=egress_body.get("model"),
     )
     try:
         if profile.dialect != "anthropic":
@@ -259,7 +251,7 @@ async def _messages_handler(request: web.Request) -> web.StreamResponse:
             return _not_implemented_response(
                 "relay not yet implemented", profile, request.app["routing_debug"]
             )
-        return await _relay(request, body, profile, comp)
+        return await _relay(request, egress_body, profile, comp)
     finally:
         _finalize(request, comp, start)
 
@@ -283,11 +275,12 @@ async def _count_tokens_handler(request: web.Request) -> web.StreamResponse:
         return await _forward(request, body=body)
     if kind == "unknown":
         return _unknown_profile_response(registry)
+    egress_body = mutate_body(profile, json.loads(body))
     comp = _Completion(
         ingress="anthropic",
         profile=profile.name,
         upstream=str(relay_upstream_url(profile.base_url, "/v1/messages/count_tokens")),
-        model=_stripped_model(body),
+        model=egress_body.get("model"),
     )
     try:
         if profile.dialect != "anthropic":
@@ -295,13 +288,13 @@ async def _count_tokens_handler(request: web.Request) -> web.StreamResponse:
             return _not_implemented_response(
                 "count_tokens relay not yet implemented", profile, request.app["routing_debug"]
             )
-        return await _count_tokens(request, body, profile, comp)
+        return await _count_tokens(request, egress_body, profile, comp)
     finally:
         _finalize(request, comp, start)
 
 
 async def _relay(
-    request: web.Request, body: bytes, profile: Profile, comp: _Completion
+    request: web.Request, egress_body: dict, profile: Profile, comp: _Completion
 ) -> web.StreamResponse:
     """Inject the Profile's key from the Claude Key file and forward on the Relay branch.
 
@@ -318,7 +311,13 @@ async def _relay(
     response: web.StreamResponse | None = None
     try:
         response = await forward_relay(
-            request, body, profile, key, request.app["session"], "/v1/messages", usage_tee=tee
+            request,
+            egress_body,
+            profile,
+            key,
+            request.app["session"],
+            "/v1/messages",
+            usage_tee=tee,
         )
         return response
     finally:
@@ -335,15 +334,15 @@ async def _relay(
 
 
 async def _count_tokens(
-    request: web.Request, body: bytes, profile: Profile, comp: _Completion
+    request: web.Request, egress_body: dict, profile: Profile, comp: _Completion
 ) -> web.StreamResponse:
     """Forward count_tokens to the Profile endpoint, or synthesize the estimate on a gap.
 
     Reuses the relay serializer/headers so the counted body is exactly what messages will
-    send (serialized once — the estimate counts those same bytes). A cached-unsupported
-    Profile skips the upstream attempt; a fresh 404/405/501 or malformed 2xx populates that
-    negative cache; a transport failure estimates WITHOUT caching; any other upstream status
-    passes through verbatim.
+    send (mutated once by the handler — the estimate counts those same bytes, Dispatch
+    marker included). A cached-unsupported Profile skips the upstream attempt; a fresh
+    404/405/501 or malformed 2xx populates that negative cache; a transport failure
+    estimates WITHOUT caching; any other upstream status passes through verbatim.
     """
     reader = request.app["claude_keys"]
     key = reader.get(profile.api_key_env)
@@ -351,7 +350,7 @@ async def _count_tokens(
         comp.status = 401
         return _auth_error_response(profile.api_key_env, reader.path)
 
-    egress_bytes = serialize_body(mutate_body(profile, json.loads(body)))
+    egress_bytes = serialize_body(egress_body)
     cache = request.app["count_tokens_unsupported"]
     cache_key = (profile.name, profile.base_url)
     if cache_key in cache:

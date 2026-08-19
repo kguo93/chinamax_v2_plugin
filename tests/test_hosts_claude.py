@@ -137,9 +137,11 @@ def test_task_command_text_invariants():
     # Unknown-PROFILE error names the valid Profile list (never a model list).
     assert "valid Profile list" in text
 
-    # Model pass-through: never validated, rewrite-helper invocation, verbatim provider error.
+    # Model pass-through: never validated, the Dispatch marker line, verbatim provider
+    # error — and NO file-rewrite step of any kind (ADR 0004 as amended 2026-08-19).
     assert "never validated" in lower
-    assert '"${CLAUDE_PLUGIN_ROOT}/scripts/chinamaxM" set_model claude <profile> <model>' in text
+    assert "[chinamaxm model=<model>]" in text
+    assert "set_model" not in text
     assert "verbatim as the Worker's error" in text
 
     # Named background spawn: default slug name, numeric fallback, and the custom-name

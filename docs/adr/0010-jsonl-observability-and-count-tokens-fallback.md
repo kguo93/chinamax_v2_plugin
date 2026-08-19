@@ -57,3 +57,12 @@ This amendment also **corrects the 2026-08-13 wording** above: the `count_tokens
 values are `upstream` / `estimated` (as the shipped `chinamaxM.observability` / proxy set
 them and the JSONL carries), NOT the `forwarded` / `estimator` the prose originally named —
 a documentation typo, not a behavior change.
+
+**Amended 2026-08-19 (`model` logs the EFFECTIVE egress model — cross-ref ADR 0004 as
+amended 2026-08-19).** The 2026-08-13 field-semantics bullet read: "`model` logs the
+FORWARDED model string (profile prefix already stripped)". That stays true and is
+sharpened: `model` is the model of the mutated egress body — the Dispatch-marker override
+applied when present — on the Anthropic-ingress relay, count_tokens, AND Seam lines, so
+the logged model always equals what the provider was billed for. No extra field records
+the pre-override model (operator decision: effective only). The mutation is computed once
+per request and shared between the wire and the log, so the two can never disagree.

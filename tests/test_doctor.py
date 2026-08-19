@@ -30,7 +30,7 @@ from chinamaxM.doctor import (
     render_report,
     run_doctor,
 )
-from chinamaxM.generate import regenerate, set_model
+from chinamaxM.generate import regenerate
 from chinamaxM.ops.supervision import SupervisionError, SupervisionStatus, port_live
 from chinamaxM.registry import load_registry
 
@@ -310,6 +310,21 @@ def test_drift_claude_only(install):
     assert code == 1
 
 
+def test_drift_model_line_is_strict(install):
+    """A model-line-only edit IS drift (ADR 0004 as amended 2026-08-19: strict equality)."""
+    agent = install.claude / "agents" / "deepseek.md"
+    agent.write_text(
+        agent.read_text(encoding="utf-8").replace(
+            "model: deepseek/deepseek-v4-pro[1m]", "model: deepseek/deepseek-x"
+        ),
+        encoding="utf-8",
+    )
+    findings, code = run(install)
+    assert one(findings, "drift-claude").status == "fail"
+    assert not find(findings, "drift-model")  # the info display path is retired
+    assert code == 1
+
+
 def test_drift_codex_only(install):
     """A missing Codex role TOML FAILs the Codex-host drift check; no Claude row appears."""
     (install.codex / "agents" / "deepseek.toml").unlink()
@@ -517,15 +532,14 @@ def test_full_report_never_prints_key_value(install):
     assert CANARY not in render_report(findings)
 
 
-def test_profiles_shows_current_model_after_rewrite(install, monkeypatch):
-    """A dispatch model rewrite surfaces the current model line in /profiles."""
-    monkeypatch.setenv("CHINAMAXM_CLAUDE_HOME", str(install.claude))
-    monkeypatch.setenv("CHINAMAXM_CODEX_HOME", str(install.codex))
-    set_model("claude", "deepseek", "deepseek-v4-flash")
+def test_profiles_shows_default_model_only(install):
+    """/profiles shows the Registry default only — no 'current model' display path
+    (ADR 0005 as amended 2026-08-19: a per-dispatch override is never on-disk state)."""
     text, _ = render_profiles(
         host="claude", claude_root=install.claude, codex_root=install.codex, overlay_path=install.overlay
     )
-    assert "current model: deepseek-v4-flash" in text
+    assert "default model: deepseek-v4-pro[1m]" in text
+    assert "current model" not in text
 
 
 # ---------------------------------------------- test 6 (SessionStart hook, LIVE)

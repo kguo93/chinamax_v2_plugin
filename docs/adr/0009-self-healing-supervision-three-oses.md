@@ -142,7 +142,8 @@ the launcher and all three hook shims beats three private ones.
 
 All command surfaces launch through the shim now — `/setup`, `/doctor`, `/profiles`, and `/task`'s
 `set_model` rewrite (the last was latently broken as a bare `python -m chinamaxM.set_model` with no
-`PYTHONPATH` and no env). The three hook shims (`session_start_hook`, `worker_contract_hook`,
+`PYTHONPATH` and no env; `set_model` itself was retired 2026-08-19 — ADR 0004 as amended — so the
+launcher now maps `{setup|doctor}` only). The three hook shims (`session_start_hook`, `worker_contract_hook`,
 `codex_worker_contract_hook`) share rungs 1–3 plus the `conda run` helper and keep their fail-open
 `exit 0` contract and `conda run --no-capture-output` stdin semantics; hooks NEVER use the
 launcher's base-miniconda or ambient bootstrap rungs (5–6).

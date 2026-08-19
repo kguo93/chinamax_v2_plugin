@@ -301,10 +301,10 @@ def responses_to_anthropic(
     body.update(anthropic_params)
 
     # POST shim: thinking-merge + Scrub + extras via the proxy-02 relay pipeline (reused
-    # verbatim). ``mutate_body``'s prefix-strip is a no-op here (the Responses model rides
-    # through with no Profile prefix); restore it defensively so the model is never mangled.
+    # verbatim). ``mutate_body``'s prefix-strip is profile-scoped, so a bare Responses model
+    # containing ``/`` is never mangled; a Dispatch marker in the translated messages
+    # substitutes the egress model inside that same funnel (ADR 0004 as amended 2026-08-19).
     body = mutate_body(profile, body)
-    body["model"] = model
     body["stream"] = bool(stream)
 
     return body, SeamMeta(stripped_tools=stripped_tools, synthesized_max_tokens=synthesized)
@@ -401,7 +401,10 @@ def _build_messages(items: list) -> list[dict]:
     reaches the provider.
 
     An item with no ``type`` is read as a ``message``, matching the Responses API, where
-    ``type`` is optional on an input message and every other item type carries it.
+    ``type`` is optional on an input message and every other item type carries it. A Codex
+    collab ``agent_message`` item is normalized to a plain ``message`` first
+    (:func:`_agent_message_to_message`, ADR 0002 as amended 2026-08-19) and then rides the
+    ordinary message path.
 
     A call run's outputs are hoisted ahead of anything a Host interleaved between them
     (``_hoist_run_outputs``) before grouping, so the grouped results are always the one
@@ -424,6 +427,9 @@ def _build_messages(items: list) -> list[dict]:
         if not isinstance(item, dict):
             raise SeamError(400, "each input item must be an object", "invalid_request_error")
         itype = item.get("type") or "message"  # optional on an input message item
+        if itype == "agent_message":
+            item = _agent_message_to_message(item)
+            itype = "message"
 
         if itype == "message" and item.get("role") in _SYSTEM_ROLES:
             index += 1  # already folded into the top-level system
@@ -465,6 +471,33 @@ def _build_messages(items: list) -> list[dict]:
     if pending_thinking:
         messages.append({"role": "assistant", "content": pending_thinking})
     return messages
+
+
+def _agent_message_to_message(item: dict) -> dict:
+    """Normalize a Codex collab ``agent_message`` item to a plain ``message`` item.
+
+    Two live shapes exist (ADR 0002 as amended 2026-08-19): a task delivered by a
+    direct-collab parent carries a ``content`` list of text parts and becomes a USER
+    message; a rollout self-output carries a string ``message`` field and becomes an
+    ASSISTANT message with one text part. The result rides the ordinary message path — no
+    parallel builder.
+
+    Raises:
+        SeamError: 400 when the item carries neither shape.
+    """
+    if isinstance(item.get("content"), list):
+        return {"type": "message", "role": "user", "content": item["content"]}
+    if isinstance(item.get("message"), str):
+        return {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": item["message"]}],
+        }
+    raise SeamError(
+        400,
+        "agent_message item carries neither a content list nor a message string",
+        "invalid_request_error",
+    )
 
 
 def _scan_function_call_run(

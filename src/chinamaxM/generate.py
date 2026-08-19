@@ -1,4 +1,4 @@
-"""Generation engine: resolved Registry to Host artifacts, drift, and model rewrite.
+"""Generation engine: resolved Registry to Host artifacts, and drift.
 
 Both Hosts share this pure engine (ADR 0004 as amended 2026-08-13). From a resolved
 Registry it produces, one artifact per Profile:
@@ -10,8 +10,9 @@ Registry it produces, one artifact per Profile:
   via TOML-preserving edits (no ``env_key`` — ADR 0006);
 * a Codex role TOML at ``<codex-root>/agents/<profile>.toml``.
 
-The model line is dispatch-mutable state: :func:`set_model` rewrites only that line, and
-regeneration resets it to the Profile default. :func:`detect_drift` classifies on-disk
+Generated artifacts are immutable outside generation (ADR 0004 as amended 2026-08-19):
+regeneration is the ONLY edit path, and a per-dispatch model override rides the Dispatch
+marker in the spawn prompt, never a file edit. :func:`detect_drift` classifies on-disk
 state without ever mutating or raising, so Doctor can consume it as pure diagnosis.
 
 Host roots resolve through the one canonical chain shared with every Host surface
@@ -26,16 +27,15 @@ import os
 import re
 import stat
 import tempfile
-import tomllib
 from pathlib import Path
-from typing import Iterable, Literal, Mapping
+from typing import Iterable, Mapping
 
 # ``tomlkit`` and ``yaml`` are imported LAZILY inside the functions that serialize/parse
 # TOML/YAML — never at module load — so a consumer running under a bare ambient interpreter
 # that lacks these env-only deps (setup.py's Bootstrap contract) can import this module.
 
 from .keyfiles import resolve_host_root
-from .registry import Profile, Registry, load_registry
+from .registry import Profile, Registry
 
 #: Ownership marker written into every generated Claude agent (first body line).
 CLAUDE_MARKER = "<!-- chinamaxM-generated: do not hand-edit -->"
@@ -62,13 +62,17 @@ _YAML_WIDTH = 1 << 30
 #: and URL-path surfaces (ADR 0004 as amended) — lowercase alphanumerics and ``-`` only.
 _NAME_GRAMMAR = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
-#: Prefix for an operator-facing Worker INSTANCE name (the spawn ``name``), distinct from
+#: Stem of an operator-facing Worker INSTANCE name (the spawn ``name``), distinct from
 #: the generated artifact name (the bare Profile) and from :data:`PROVIDER_PREFIX` (the
-#: Codex provider ID, capital-M). A named Worker spawn is ``chinamaxm-<profile>-<suffix>``
-#: with a non-empty lowercase ``[a-z0-9-]`` suffix, so the name references chinamaxM and the
-#: task rather than a bare Profile index (ADR 0004 as amended 2026-08-18). Lowercase to
-#: satisfy the shared name grammar on both Hosts.
-WORKER_NAME_PREFIX = "chinamaxm-"
+#: Codex provider ID, capital-M). The per-Host separator joins it: a named Worker spawn is
+#: ``chinamaxm-<profile>-<suffix>`` on Claude and ``chinamaxm_<profile>_<suffix>`` on Codex
+#: (Codex 0.147 rejects hyphenated agent names — ADR 0004 as amended 2026-08-19), each with
+#: a non-empty lowercase suffix, so the name references chinamaxM and the task rather than
+#: a bare Profile index.
+WORKER_NAME_PREFIX = "chinamaxm"
+
+#: The per-Host Worker instance-name separators: ``-`` on Claude, ``_`` on Codex.
+_WORKER_NAME_SEPARATORS = ("-", "_")
 
 #: Reserved Profile names on either Host, matched case-insensitively (ADR 0004 as
 #: amended): built-in Claude Code agents plus the reserved Codex provider IDs. Checked in
@@ -113,7 +117,7 @@ WORKER_INSTRUCTIONS = (
 
 
 class GenerationError(ValueError):
-    """Raised by generation and :func:`set_model` on preflight or on-disk faults.
+    """Raised by generation on preflight or on-disk faults.
 
     Preflight raises (reserved/illegal Profile names, an unparseable or wrongly-shaped
     ``config.toml``) fire before any write, so a Codex-side fault never leaves partial
@@ -159,20 +163,6 @@ def _config_path(roots: Mapping[str, Path]) -> Path:
 
 
 # ----------------------------------------------------------------- artifact content
-
-
-def _yaml_model_line(value: str) -> str:
-    """Serialize a single ``model:`` frontmatter line (no trailing newline)."""
-    import yaml  # lazy (Bootstrap): env-only dep, never imported at module load
-
-    dumped = yaml.safe_dump(
-        {"model": value},
-        sort_keys=False,
-        default_flow_style=False,
-        allow_unicode=True,
-        width=_YAML_WIDTH,
-    )
-    return dumped.rstrip("\n")
 
 
 def _claude_agent_content(profile: Profile) -> str:
@@ -291,35 +281,40 @@ def matches_generated_agent(name: str, profile_names: Iterable[str]) -> bool:
     """Return whether ``name`` addresses a generated Worker for some Profile.
 
     A generated Worker is spawned either as the bare Profile agent (its ``agent_type`` is
-    the Profile name) or under an operator-chosen INSTANCE name
-    ``chinamaxm-<profile>-<suffix>`` with a non-empty suffix (a named spawn surfaces the
-    NAME, not the subagent type — ADR 0004 as amended 2026-08-18). This is the single shared
-    matcher the worker-contract hook reuses on both its SubagentStart (``agent_type``) and
-    PreToolUse (``subagent_type``) branches, so the rule is never re-implemented inline.
+    the Profile name) or under an operator-chosen INSTANCE name — the Claude hyphen form
+    ``chinamaxm-<profile>-<suffix>`` or the Codex underscore form
+    ``chinamaxm_<profile>_<suffix>``, each with a non-empty suffix (a named spawn surfaces
+    the NAME, not the subagent type — ADR 0004 as amended 2026-08-19). This is the single
+    shared matcher the worker-contract hook reuses on both its SubagentStart
+    (``agent_type``) and PreToolUse (``subagent_type``) branches, so the rule is never
+    re-implemented inline.
 
-    Matching is anchored and case-sensitive: the ``chinamaxm-<profile>-`` prefix must match
-    exactly, so ``chinamaxm-kimono-x`` never matches Profile ``kimi`` and a bare-substring
-    misfire is impossible. The legacy ``<profile>-<suffix>`` instance form (e.g.
-    ``deepseek-1``) is NOT matched — the canonical grammar now carries the ``chinamaxm-``
-    prefix (ADR 0004 as amended 2026-08-18). Reserved Profile names cannot enter the
-    Registry (ADR 0003/0004), so a built-in agent name can never match. An unrelated agent
-    whose name merely starts ``chinamaxm-<profile>-`` gets the benign contract — the
-    accepted false-positive direction.
+    Matching is anchored and case-sensitive: the ``chinamaxm<sep><profile><sep>`` prefix
+    must match exactly (with ONE separator used throughout), so ``chinamaxm-kimono-x``
+    never matches Profile ``kimi`` and a bare-substring misfire is impossible. The legacy
+    ``<profile>-<suffix>`` instance form (e.g. ``deepseek-1``) is NOT matched. Shipped
+    Profile names are ``[a-z0-9]``-only; a Profile name containing a separator character
+    would make the two grammars ambiguous and is out of contract. Reserved Profile names
+    cannot enter the Registry (ADR 0003/0004), so a built-in agent name can never match.
+    An unrelated agent whose name merely starts with a full prefix gets the benign
+    contract — the accepted false-positive direction.
 
     Args:
         name: The candidate ``agent_type`` or ``subagent_type`` from a hook event.
         profile_names: The resolved Registry's Profile names.
 
     Returns:
-        ``True`` when ``name`` equals a Profile name or
-        ``chinamaxm-<profile>-<non-empty suffix>``.
+        ``True`` when ``name`` equals a Profile name,
+        ``chinamaxm-<profile>-<non-empty suffix>``, or
+        ``chinamaxm_<profile>_<non-empty suffix>``.
     """
     for profile in profile_names:
         if name == profile:
             return True
-        prefix = f"{WORKER_NAME_PREFIX}{profile}-"
-        if name.startswith(prefix) and len(name) > len(prefix):
-            return True
+        for sep in _WORKER_NAME_SEPARATORS:
+            prefix = f"{WORKER_NAME_PREFIX}{sep}{profile}{sep}"
+            if name.startswith(prefix) and len(name) > len(prefix):
+                return True
     return False
 
 
@@ -337,97 +332,6 @@ def _read_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except OSError:
         return None
-
-
-# --------------------------------------------------------------- model-line helpers
-
-
-def _frontmatter_bounds(lines: list[str]) -> tuple[int, int] | None:
-    """Return ``(open_index, close_index)`` of the ``---`` frontmatter fences, or None."""
-    if not lines or lines[0] != "---":
-        return None
-    for index in range(1, len(lines)):
-        if lines[index] == "---":
-            return 0, index
-    return None
-
-
-def _extract_claude_model(text: str) -> str | None:
-    """Return the frontmatter model value, or ``None`` when it cannot be found."""
-    lines = text.split("\n")
-    bounds = _frontmatter_bounds(lines)
-    if bounds is None:
-        return None
-    open_index, close_index = bounds
-    for line in lines[open_index + 1 : close_index]:
-        if line.startswith("model:"):
-            import yaml  # lazy (Bootstrap): env-only dep, never imported at module load
-
-            try:
-                return yaml.safe_load(line)["model"]
-            except Exception:
-                return line[len("model:") :].strip()
-    return None
-
-
-def _extract_codex_model(text: str) -> str | None:
-    """Return the top-level ``model`` value, or ``None`` when it cannot be found."""
-    try:
-        parsed = tomllib.loads(text)
-    except Exception:
-        return None
-    value = parsed.get("model")
-    return value if isinstance(value, str) else None
-
-
-def _strip_claude_model_line(text: str) -> str:
-    """Return the Claude agent text with its frontmatter ``model:`` line removed."""
-    lines = text.split("\n")
-    bounds = _frontmatter_bounds(lines)
-    if bounds is None:
-        return text
-    open_index, close_index = bounds
-    kept = [
-        line
-        for index, line in enumerate(lines)
-        if not (open_index < index < close_index and line.startswith("model:"))
-    ]
-    return "\n".join(kept)
-
-
-def _strip_codex_model_line(text: str) -> str:
-    """Return the Codex role text with its top-level ``model =`` line removed."""
-    kept = [line for line in text.split("\n") if not re.match(r"model\s*=", line)]
-    return "\n".join(kept)
-
-
-def _rewrite_claude_model_line(text: str, value: str) -> str:
-    """Return the Claude agent text with only its frontmatter model line replaced.
-
-    Raises:
-        GenerationError: If the text has no frontmatter ``model:`` line to rewrite.
-    """
-    lines = text.split("\n")
-    bounds = _frontmatter_bounds(lines)
-    if bounds is not None:
-        open_index, close_index = bounds
-        for index in range(open_index + 1, close_index):
-            if lines[index].startswith("model:"):
-                lines[index] = _yaml_model_line(value)
-                return "\n".join(lines)
-    raise GenerationError("no frontmatter 'model:' line to rewrite")
-
-
-def _rewrite_codex_model_line(text: str, value: str) -> str:
-    """Return the Codex role text with only its top-level ``model`` value replaced.
-
-    The tomlkit round-trip preserves every other byte and escapes the value.
-    """
-    import tomlkit  # lazy (Bootstrap): env-only dep, never imported at module load
-
-    doc = tomlkit.parse(text)
-    doc["model"] = value
-    return tomlkit.dumps(doc)
 
 
 # ------------------------------------------------------------------- atomic writing
@@ -579,10 +483,10 @@ def detect_drift(
 ) -> dict[str, object]:
     """Classify on-disk state against the expected artifact set without mutating.
 
-    The model line is dispatch-mutable state, so it is excluded from the stale comparison
-    and instead surfaced under ``model_lines``. This function never raises on bad on-disk
-    state (Doctor is pure diagnosis); unparseable or wrongly-shaped ``config.toml`` states
-    are reported under ``conflicts``.
+    Staleness is STRICT whole-content equality, model line included (ADR 0004 as amended
+    2026-08-19: the artifact is immutable outside generation, so any divergence is drift).
+    This function never raises on bad on-disk state (Doctor is pure diagnosis);
+    unparseable or wrongly-shaped ``config.toml`` states are reported under ``conflicts``.
 
     Args:
         registry: The resolved Registry.
@@ -592,22 +496,19 @@ def detect_drift(
             to the invoking Host (ADR 0005 as amended 2026-08-18).
 
     Returns:
-        ``{"missing", "stale", "foreign", "conflicts"}`` sorted string lists plus
-        ``model_lines`` mapping each present artifact path to its current model value.
-        File artifacts are labelled by absolute path; provider tables by
+        ``{"missing", "stale", "foreign", "conflicts"}`` sorted string lists. File
+        artifacts are labelled by absolute path; provider tables by
         ``model_providers.chinamaxM-<profile>``.
     """
     missing: list[str] = []
     stale: list[str] = []
     foreign: list[str] = []
     conflicts: list[str] = []
-    model_lines: dict[str, str | None] = {}
 
     expected = expected_artifacts(registry, roots, host)
     expected_paths = set(expected)
 
     for path, content in expected.items():
-        is_codex = path.suffix == ".toml"
         if not path.exists():
             missing.append(str(path))
             continue
@@ -615,11 +516,7 @@ def detect_drift(
         if current is None or not _has_marker(current):
             conflicts.append(str(path))
             continue
-        model_lines[str(path)] = (
-            _extract_codex_model(current) if is_codex else _extract_claude_model(current)
-        )
-        strip = _strip_codex_model_line if is_codex else _strip_claude_model_line
-        if strip(current) != strip(content):
+        if current != content:
             stale.append(str(path))
 
     scan_dirs: list[Path] = []
@@ -645,7 +542,6 @@ def detect_drift(
         "stale": sorted(stale),
         "foreign": sorted(foreign),
         "conflicts": sorted(conflicts),
-        "model_lines": model_lines,
     }
 
 
@@ -694,8 +590,7 @@ def regenerate(
     first, so no file is written when preflight would fail. Only marker-bearing files and
     ``chinamaxM-`` tables are ever overwritten, deleted, or pruned; a conflict path (an
     expected path occupied by a marker-less file) is skipped and re-reported. Writes are
-    byte-identical-skipped, atomic, and mode-preserving; a rewritten model line is reset to
-    the Profile default because the expected content carries the default.
+    byte-identical-skipped, atomic, and mode-preserving.
 
     Args:
         registry: The resolved Registry.
@@ -822,54 +717,3 @@ def remove_provider_entries(roots: Mapping[str, Path]) -> dict[str, list[str]]:
         if new_text != text:
             _atomic_write(config_path, new_text.encode("utf-8"))
     return {"removed": sorted(removed)}
-
-
-# ------------------------------------------------------------------ model rewrite
-
-
-def set_model(host: Literal["claude", "codex"], profile: str, model: str) -> Path:
-    """Rewrite only the model line of one generated artifact (the dispatch conduit).
-
-    Resolves the Host root through the canonical chain. The model string is never
-    validated — an arbitrary value (spaces, quotes) lands verbatim, serializer-escaped.
-    The Claude frontmatter becomes ``model: <profile>/<model>``; the Codex role becomes
-    ``model = <model>`` (bare). Every other byte is untouched; the write is atomic and
-    mode-preserving. A marker-less target file is refused untouched.
-
-    Args:
-        host: ``"claude"`` or ``"codex"``.
-        profile: A Profile name in the resolved Registry.
-        model: The replacement model string (never validated).
-
-    Returns:
-        The path of the rewritten artifact.
-
-    Raises:
-        GenerationError: On an unknown Host, an unknown Profile, a missing artifact, or a
-            marker-less target file.
-    """
-    if host not in ("claude", "codex"):
-        raise GenerationError(f"unknown host {host!r}; expected 'claude' or 'codex'")
-
-    registry = load_registry()
-    if profile not in registry.profiles:
-        valid = ", ".join(sorted(registry.profiles))
-        raise GenerationError(f"unknown profile {profile!r}; valid profiles: {valid}")
-
-    root = resolve_host_root(host)
-    suffix = "md" if host == "claude" else "toml"
-    path = root / AGENTS_DIR_NAME / f"{profile}.{suffix}"
-    if not path.exists():
-        raise GenerationError(
-            f"no generated agent at {path}; run generation before setting a model"
-        )
-    text = _read_text(path)
-    if text is None or not _has_marker(text):
-        raise GenerationError(f"refusing to edit marker-less file {path}")
-
-    if host == "claude":
-        new_text = _rewrite_claude_model_line(text, f"{profile}/{model}")
-    else:
-        new_text = _rewrite_codex_model_line(text, model)
-    _atomic_write(path, new_text.encode("utf-8"))
-    return path

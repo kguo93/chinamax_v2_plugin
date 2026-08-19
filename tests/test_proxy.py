@@ -690,6 +690,165 @@ async def test_relay_extras_merged_last_replace_on_conflict(
     assert raw.index(b'"output_config"') > raw.index(b'"reasoning_effort"')
 
 
+# ------------------------------------------------------- Dispatch marker (ADR 0004 amended)
+
+
+def _marker_body(model: str, marker_model: str | None, **extra) -> bytes:
+    """Build a relay body whose first user message opens with a Dispatch marker line."""
+    text = "do the task"
+    if marker_model is not None:
+        text = f"[chinamaxm model={marker_model}]\n\n{text}"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}],
+        **extra,
+    }
+    return json.dumps(payload).encode()
+
+
+async def test_marker_substitutes_egress_model_from_request_one(
+    make_proxy, relay_registry, claude_home, fake_provider
+):
+    """A Dispatch marker substitutes the egress model on the FIRST request; the marker text
+    stays in the forwarded body; the JSONL line logs the EFFECTIVE model."""
+    claude_home.write_keys(_ALL_KEYS)
+    fake_provider.respond(status=200, body=b'{"ok":true}')
+    lines: list[dict] = []
+    client = await make_proxy(
+        relay_registry, claude_home=str(claude_home.root), log_sink=lines.append
+    )
+
+    response = await client.post(
+        "/v1/messages",
+        data=_marker_body("deepseek/deepseek-v4-pro[1m]", "deepseek-v4-flash"),
+        skip_auto_headers=["Content-Type"],
+    )
+    assert response.status == 200
+
+    forwarded = json.loads(fake_provider.requests[-1].body)
+    assert forwarded["model"] == "deepseek-v4-flash"
+    # The marker is kept in the forwarded body, not stripped.
+    assert "[chinamaxm model=deepseek-v4-flash]" in forwarded["messages"][0]["content"][0]["text"]
+    # JSONL logs the effective egress model (ADR 0010 as amended 2026-08-19).
+    assert len(lines) == 1
+    assert lines[0]["model"] == "deepseek-v4-flash"
+
+
+async def test_marker_greedy_capture_keeps_bracket_suffix(
+    make_proxy, relay_registry, claude_home, fake_provider
+):
+    """A ``[1m]``-suffixed model ID survives the marker capture intact (greedy to line end)."""
+    claude_home.write_keys(_ALL_KEYS)
+    fake_provider.respond(status=200, body=b"ok")
+    client = await make_proxy(relay_registry, claude_home=str(claude_home.root))
+
+    response = await client.post(
+        "/v1/messages",
+        data=_marker_body("deepseek/m", "deepseek-v4-pro[1m]"),
+        skip_auto_headers=["Content-Type"],
+    )
+    assert response.status == 200
+    assert json.loads(fake_provider.requests[-1].body)["model"] == "deepseek-v4-pro[1m]"
+
+
+async def test_marker_first_match_wins(make_proxy, relay_registry, claude_home, fake_provider):
+    """Two markers across user messages: the FIRST in message order wins; scanning stops."""
+    claude_home.write_keys(_ALL_KEYS)
+    fake_provider.respond(status=200, body=b"ok")
+    client = await make_proxy(relay_registry, claude_home=str(claude_home.root))
+
+    payload = {
+        "model": "deepseek/m",
+        "messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "[chinamaxm model=never-assistant]"}]},
+            {"role": "user", "content": [{"type": "text", "text": "[chinamaxm model=first-wins]\n\ntask"}]},
+            {"role": "user", "content": "[chinamaxm model=second-loses]"},
+        ],
+    }
+    response = await client.post(
+        "/v1/messages", data=json.dumps(payload).encode(), skip_auto_headers=["Content-Type"]
+    )
+    assert response.status == 200
+    assert json.loads(fake_provider.requests[-1].body)["model"] == "first-wins"
+
+
+async def test_no_marker_leaves_egress_model_unchanged(
+    make_proxy, relay_registry, claude_home, fake_provider
+):
+    """Without a marker the egress model is the prefix-stripped inbound model, unchanged.
+    A marker NOT alone on its line (or mid-line) never fires (line-anchored regex)."""
+    claude_home.write_keys(_ALL_KEYS)
+    fake_provider.respond(status=200, body=b"ok")
+    client = await make_proxy(relay_registry, claude_home=str(claude_home.root))
+
+    response = await client.post(
+        "/v1/messages",
+        data=_marker_body("deepseek/deepseek-v4-pro[1m]", None),
+        skip_auto_headers=["Content-Type"],
+    )
+    assert response.status == 200
+    assert json.loads(fake_provider.requests[-1].body)["model"] == "deepseek-v4-pro[1m]"
+
+    # A quoted/inline mention never fires: the marker must be alone on its own line.
+    fake_provider.respond(status=200, body=b"ok")
+    payload = {
+        "model": "deepseek/m",
+        "messages": [
+            {"role": "user", "content": "see the [chinamaxm model=inline-mention] syntax"}
+        ],
+    }
+    response = await client.post(
+        "/v1/messages", data=json.dumps(payload).encode(), skip_auto_headers=["Content-Type"]
+    )
+    assert response.status == 200
+    assert json.loads(fake_provider.requests[-1].body)["model"] == "m"
+
+
+async def test_default_branch_never_scanned_for_marker(proxy_client, fake_provider):
+    """A prefixless body carrying a marker rides the Default branch BYTE-IDENTICAL —
+    no body inspection, no model substitution (ADR 0001 guarantee untouched)."""
+    body = json.dumps(
+        {
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "user", "content": "[chinamaxm model=must-not-apply]\n\nhello"}
+            ],
+        }
+    ).encode()
+    fake_provider.respond(status=200, body=b"ok")
+    response = await proxy_client.post(
+        "/v1/messages", data=body, skip_auto_headers=["Content-Type"]
+    )
+    assert response.status == 200
+    assert fake_provider.requests[-1].body == body
+
+
+async def test_count_tokens_counts_marker_substituted_body(
+    make_proxy, relay_registry, claude_home, fake_provider
+):
+    """count_tokens forwards the SAME marker-substituted body messages would send, and its
+    JSONL line logs the effective model."""
+    claude_home.write_keys(_ALL_KEYS)
+    fake_provider.respond(
+        status=200, headers={"content-type": "application/json"}, body=b'{"input_tokens":7}'
+    )
+    lines: list[dict] = []
+    client = await make_proxy(
+        relay_registry, claude_home=str(claude_home.root), log_sink=lines.append
+    )
+
+    response = await client.post(
+        "/v1/messages/count_tokens",
+        data=_marker_body("deepseek/deepseek-v4-pro[1m]", "deepseek-v4-flash"),
+        skip_auto_headers=["Content-Type"],
+    )
+    assert response.status == 200
+    forwarded = json.loads(fake_provider.requests[-1].body)
+    assert forwarded["model"] == "deepseek-v4-flash"
+    assert fake_provider.requests[-1].raw_path == "/v1/messages/count_tokens"
+    assert lines[0]["model"] == "deepseek-v4-flash"
+
+
 async def test_relay_upstream_errors(make_proxy, relay_registry, claude_home, fake_provider):
     """Pins plan decisions: an upstream non-2xx relays verbatim; a connect failure ⇒ pinned 502."""
     claude_home.write_keys(_ALL_KEYS)

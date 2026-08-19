@@ -8,7 +8,7 @@ CHINAMAXM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 . "${CHINAMAXM_SCRIPT_DIR}/_interpreter.sh"
 
 usage() {
-  echo "usage: chinamaxM {setup|doctor|set_model} [args...]" >&2
+  echo "usage: chinamaxM {setup|doctor} [args...]" >&2
   exit 2
 }
 
@@ -18,7 +18,6 @@ shift
 case "${subcommand}" in
   setup) module=chinamaxM.setup ;;
   doctor) module=chinamaxM.doctor ;;
-  set_model) module=chinamaxM.set_model ;;
   *) usage ;;
 esac
 chinamaxm_exec "${module}" "$@"

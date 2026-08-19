@@ -1,15 +1,17 @@
 """The Relay branch: pure body mutation, order-stable serialization, and the forwarder.
 
 A Profile-prefixed Anthropic-dialect request is forwarded to the Profile's
-Anthropic-compatible endpoint (ADR 0001 as amended): the Profile prefix is stripped, the
-Claude-flavored ``thinking``/``output_config`` form removed, Scrub fields dropped
+Anthropic-compatible endpoint (ADR 0001 as amended): the Profile's own prefix is stripped,
+the Claude-flavored ``thinking``/``output_config`` form removed, Scrub fields dropped
 (``cache_control`` recursively at any depth), the Profile's thinking policy merged at the
-body root, and ``request_extras`` merged last. Every mutation is a deterministic function
-of ``(Profile, body)`` so the serialized request prefix stays byte-stable turn over turn
+body root, ``request_extras`` merged last, and a Dispatch marker override applied last of
+all (ADR 0004 as amended 2026-08-19). Every mutation is a deterministic function of
+``(Profile, body)`` so the serialized request prefix stays byte-stable turn over turn
 (ADR 0002 guard; ADR 0003 pins the canonical order).
 
-:func:`mutate_body` and :func:`serialize_body` are pure; :func:`forward_relay` takes the
-upstream path as a parameter so proxy-04 can reuse it for count_tokens.
+:func:`mutate_body`, :func:`resolve_dispatch_marker`, and :func:`serialize_body` are pure;
+:func:`forward_relay` takes the already-mutated egress body and the upstream path as
+parameters so proxy-04 can reuse it for count_tokens.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
 
 import aiohttp
 import yarl
@@ -27,6 +30,11 @@ from chinamaxM.registry import Profile
 
 #: Egress ``anthropic-version`` applied when the inbound request carries none.
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
+
+#: The Dispatch marker line minted by the dispatch surfaces: ``[chinamaxm model=<model>]``
+#: (ADR 0004 as amended 2026-08-19). Line-anchored; the capture is GREEDY to the line-end
+#: bracket so a bracket-suffixed model ID (``deepseek-v4-pro[1m]``) survives intact.
+_DISPATCH_MARKER = re.compile(r"^\[chinamaxm model=(.+)\]$", re.MULTILINE)
 
 #: RFC 7230 §6.1 hop-by-hop headers, dropped in both directions on the relay branch.
 _HOP_BY_HOP = frozenset(
@@ -62,12 +70,13 @@ _STRIP_REQUEST_HEADERS = frozenset(
 def mutate_body(profile: Profile, body: dict) -> dict:
     """Return the relay-mutated egress body for ``profile`` (pure; ``body`` untouched).
 
-    The canonical order (ADR 0003 as amended): strip the Profile prefix from ``model`` →
-    strip the Claude ``thinking``/``output_config`` form → drop Scrub fields
+    The canonical order (ADR 0003 as amended): strip the Profile's OWN prefix from
+    ``model`` → strip the Claude ``thinking``/``output_config`` form → drop Scrub fields
     (``cache_control`` recursively) → merge the thinking policy (``extra_body`` sub-keys and
     the remainder both merged at the body root) → merge ``request_extras`` last
-    (replace-on-conflict, root merge). Operates on a deep copy and inserts copies of the
-    Profile sub-objects, so Registry state is never aliased.
+    (replace-on-conflict, root merge) → apply the Dispatch marker override last (ADR 0004
+    as amended 2026-08-19). Operates on a deep copy and inserts copies of the Profile
+    sub-objects, so Registry state is never aliased.
 
     Args:
         profile: The routed Profile.
@@ -78,10 +87,12 @@ def mutate_body(profile: Profile, body: dict) -> dict:
     """
     result = copy.deepcopy(body)
 
-    # (0) Strip the Profile prefix; the provider sees the bare model string verbatim.
+    # (0) Strip the Profile prefix; the provider sees the bare model string verbatim. Only
+    #     the routed Profile's own prefix is stripped, so a bare model that happens to
+    #     contain ``/`` (a Seam-borne Responses model) is never mangled.
     model = result.get("model")
-    if isinstance(model, str) and "/" in model:
-        result["model"] = model.split("/", 1)[1]
+    if isinstance(model, str) and model.startswith(f"{profile.name}/"):
+        result["model"] = model[len(profile.name) + 1 :]
 
     # (1) Strip the Claude-flavored thinking / output_config form from the body root.
     result.pop("thinking", None)
@@ -105,7 +116,52 @@ def mutate_body(profile: Profile, body: dict) -> dict:
     # (4) Merge request_extras last, replace-on-conflict, at the body root.
     result.update(copy.deepcopy(profile.request_extras))
 
+    # (5) Dispatch marker: a per-dispatch model override in the spawn prompt substitutes
+    #     the egress model. Applied HERE — the one shared funnel — so the messages relay,
+    #     count_tokens, and the Seam always egress (and count) the same model.
+    override = resolve_dispatch_marker(result)
+    if override is not None:
+        result["model"] = override
+
     return result
+
+
+def resolve_dispatch_marker(body: dict) -> str | None:
+    """Return the Dispatch marker's model string, or ``None`` when the body carries none.
+
+    Scans ``messages`` in order, user-role messages only; each message's string content (or
+    the ``text`` fields of its dict blocks, joined) is searched line-anchored for
+    ``[chinamaxm model=<model>]``. The FIRST match in message order wins and scanning stops;
+    the marker text is never stripped from the body. Defensive on shapes: non-list
+    ``messages``, non-dict messages, and text-less blocks are skipped, never raised on.
+
+    Args:
+        body: A parsed Anthropic-dialect request body.
+
+    Returns:
+        The captured model string verbatim (never validated), or ``None``.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            texts = [content]
+        elif isinstance(content, list):
+            texts = [
+                block.get("text")
+                for block in content
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            ]
+        else:
+            continue
+        match = _DISPATCH_MARKER.search("\n".join(texts))
+        if match:
+            return match.group(1)
+    return None
 
 
 def _strip_cache_control(node: object) -> None:
@@ -131,7 +187,7 @@ def serialize_body(body: dict) -> bytes:
 
 async def forward_relay(
     request: web.Request,
-    body: bytes,
+    egress_body: dict,
     profile: Profile,
     key: str,
     session: aiohttp.ClientSession,
@@ -139,12 +195,13 @@ async def forward_relay(
     *,
     usage_tee: object = None,
 ) -> web.StreamResponse:
-    """Mutate, auth-swap, and forward one relay request; stream the response back verbatim.
+    """Auth-swap and forward one relay request; stream the response back verbatim.
 
     Args:
         request: The inbound request (source of headers and client disconnect).
-        body: The inbound request body bytes (a valid JSON object — routing guaranteed it).
-        profile: The routed Profile supplying the endpoint and mutation policy.
+        egress_body: The already-mutated egress body (the caller ran :func:`mutate_body`
+            exactly once, so the logged model and the sent bytes always agree).
+        profile: The routed Profile supplying the endpoint.
         key: The Profile's injected API key (already resolved non-empty).
         session: The app-scoped upstream ``ClientSession`` (``auto_decompress=False``).
         upstream_path: The path appended to the Profile ``base_url`` (e.g. ``/v1/messages``).
@@ -158,7 +215,7 @@ async def forward_relay(
         (provider abort or client disconnect) returns the already-committed response so the
         caller can log the upstream status with the usage merged so far.
     """
-    out_bytes = serialize_body(mutate_body(profile, json.loads(body)))
+    out_bytes = serialize_body(egress_body)
     url = _relay_url(profile.base_url, upstream_path)
     headers = _relay_request_headers(request.headers, key)
 

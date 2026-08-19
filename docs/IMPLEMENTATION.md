@@ -34,7 +34,9 @@ ADRs/PRDs/issues/CONTEXT.md and the plans. Recorded for the record:
    NEVER validates a model string — dispatch rewrites the artifact's model line and
    spawns, and provider errors relay verbatim to main (ADR 0005/0007). No litellm at
    dispatch (its catalog demonstrably lags providers; litellm stays Seam-translation
-   only per ADR 0002).
+   only per ADR 0002). *(Superseded 2026-08-19: the dispatch-time model-line rewrite is
+   retired — a `model=` override now rides the Dispatch marker in the spawn prompt and
+   artifacts are immutable outside generation; ADR 0004 as amended 2026-08-19.)*
 4. **Reserved names**: pinned in ADR 0004, enforced at Registry load on both hosts.
 5. **Steer verb**: `send_input` stands (ADR 0007 as amended, verified on the installed
    0.147.0); `send_message` recorded as historical.
@@ -62,7 +64,7 @@ the original issues' understated "Blocked by" lines):
 | 3 | `chinamaxm-proxy-03-responses-seam` | proxy-01 (gated chunk-release fixture), proxy-02 (egress) |
 | 4 | `chinamaxm-proxy-04-observability-count-tokens` | proxy-01, proxy-02 (relay egress + `Accept-Encoding: identity` pin), proxy-03 (Seam strip record feeds `stripped_tools`) |
 | 5 | `chinamaxm-hosts-01-generators` | proxy-01 (package + Registry) |
-| 6 | `chinamaxm-hosts-02-claude-task-contract` | hosts-01 (incl. `set_model`), proxy-01 (Registry loader seam); proxy-02 only for the linchpin live capture through the real relay |
+| 6 | `chinamaxm-hosts-02-claude-task-contract` | hosts-01 (incl. `set_model`, since retired 2026-08-19 — ADR 0004 as amended), proxy-01 (Registry loader seam); proxy-02 only for the linchpin live capture through the real relay |
 | 7 | `chinamaxm-hosts-03-codex-task-dispatch` | hosts-01, hosts-02 (shared `worker_contract` + symmetry oracle) |
 | 8 | `chinamaxm-ops-01-supervision-units` | proxy-01 (package/module + pyproject) |
 | 9 | `chinamaxm-hosts-04-diagnosis-surfaces` | ops-01 (status primitives), hosts-01 (drift), hosts-02 (`hooks.json` append), proxy-01/02 (registry/keyfiles), proxy-03 (shared `scan_chat_completions_refs` in `chinamaxM.doctor`) |

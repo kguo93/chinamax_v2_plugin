@@ -35,14 +35,14 @@ authority.
 
 - `model=` OMITTED ⇒ dispatch on the Profile's `default_model`, which the generated role
   TOML already pins in its `model` line. Do nothing extra.
-- `model=<any string>` GIVEN ⇒ rewrite the generated role's model line in place FIRST, by
-  running this, then spawn:
+- `model=<any string>` GIVEN ⇒ prepend this Dispatch marker line, followed by ONE blank
+  line, to the very top of the Worker's spawn `message`, then spawn:
 
-  `"<plugin-checkout>/scripts/chinamaxM" set_model codex <profile> <model>`
+  `[chinamaxm model=<model>]`
 
-  This makes the role TOML's `model` line the BARE string verbatim (the Profile rides the
-  provider entry's ingress path, not the model string). The rewrite→spawn window is
-  per-dispatch and accepted; regeneration resets the line to the default.
+  The marker is the ENTIRE override mechanism — never edit any file, never run any
+  rewrite helper. The override is per-dispatch: it lives and dies with this Worker
+  instance.
 - A provider-side failure inside the Worker (an unknown model string included) is the
   Worker's final report: it relays back to you verbatim as the Worker's error — never
   swallow it, never rewrite it.
@@ -52,18 +52,20 @@ authority.
 Spawn the role via `spawn_agent`, selecting the agent by the role name `<profile>` (the
 bare Profile generated role — the ONLY artifact) and giving it an instance `name`:
 
-- Default `name` is `chinamaxm-<profile>-<task-slug>`, where `<task-slug>` is a short
-  lowercase kebab slug (2–4 words) you derive from the prompt, so the name references
+- Codex agent names allow ONLY lowercase letters, digits, and underscores — a hyphenated
+  name is rejected at spawn — so every instance name here uses underscores.
+- Default `name` is `chinamaxm_<profile>_<task_slug>`, where `<task_slug>` is a short
+  lowercase snake_case slug (2–4 words) you derive from the prompt, so the name references
   chinamaxM and the task rather than a bare index (e.g.
-  `chinamaxm-deepseek-repo-summary`). If that exact name is already in use this session —
+  `chinamaxm_deepseek_repo_summary`). If that exact name is already in use this session —
   counting BOTH running and completed Workers as occupied (completed Workers stay
-  addressable) — append `-2`, `-3`, … until it is free. If the prompt yields no sensible
-  slug, fall back to `chinamaxm-<profile>-<n>`, where `<n>` is the lowest positive integer
+  addressable) — append `_2`, `_3`, … until it is free. If the prompt yields no sensible
+  slug, fall back to `chinamaxm_<profile>_<n>`, where `<n>` is the lowest positive integer
   not already in use this session (same running-and-completed occupancy rule).
-- A custom `name=` MUST be `chinamaxm-<profile>-` followed by a NON-EMPTY suffix, charset
-  lowercase `[a-z0-9-]`; a duplicate custom name is an error. (A named spawn surfaces the
+- A custom `name=` MUST be `chinamaxm_<profile>_` followed by a NON-EMPTY suffix, charset
+  lowercase `[a-z0-9_]`; a duplicate custom name is an error. (A named spawn surfaces the
   NAME, not the role type, to the contract hook, and the hook matches on the
-  `chinamaxm-<profile>-` prefix — so the name must carry it or the Worker contract never
+  `chinamaxm_<profile>_` prefix — so the name must carry it or the Worker contract never
   fires.)
 
 For a headless dispatch, close stdin by appending `< /dev/null`: `codex exec` blocks on an
@@ -71,10 +73,10 @@ open pipeline stdin, so the redirect lets the run proceed unattended. On Windows
 hook/exec context is Git Bash, so the same POSIX form applies.
 
 HARD RULE: NEVER pass a `model` OR a `reasoning-effort` override on the `spawn_agent` call.
-The model half is structural — routing rides the generated role's `model_provider` and the
-`model` line you just rewrote (ADR 0004/0005), and a spawn-time model would hijack it. The
-reasoning-effort half is excluded from generated Worker roles by design. The spawn call
-carries neither.
+The model half is structural — routing rides the generated role's `model_provider` and its
+pinned `model` line (ADR 0004/0005; role models cannot be changed at spawn, and the Dispatch
+marker carries any per-dispatch override). The reasoning-effort half is excluded from
+generated Worker roles by design. The spawn call carries neither.
 
 ## Collect the report
 

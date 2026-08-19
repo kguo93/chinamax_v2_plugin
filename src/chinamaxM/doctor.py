@@ -390,13 +390,12 @@ def _check_flip_target(value: str, port: int) -> Finding:
 
 
 def check_drift(ctx: DoctorContext) -> list[Finding]:
-    """FAIL: the invoking Host's generated agents are in sync with the Registry (model line
-    excepted).
+    """FAIL: the invoking Host's generated agents are byte-in-sync with the Registry.
 
     Host-scoped (ADR 0005 as amended 2026-08-18): a Claude doctor compares only the Claude
     agents, a Codex doctor only the Codex role TOMLs + provider tables — the other Host never
-    appears. The dispatch-mutable model line is excluded from staleness and surfaced as info
-    under ``model_lines`` (ADR 0004 as amended)."""
+    appears. Staleness is strict whole-content equality, model line included (ADR 0004 as
+    amended 2026-08-19: artifacts are immutable outside generation)."""
     if ctx.registry is None:
         return [Finding("drift", "fail", "skipped", _REGISTRY_UNREADABLE)]
     from chinamaxM.generate import detect_drift
@@ -411,15 +410,9 @@ def check_drift(ctx: DoctorContext) -> list[Finding]:
     noun = "agents" if ctx.host == "claude" else "artifacts"
     label = "Claude" if ctx.host == "claude" else "Codex"
 
-    findings: list[Finding] = []
     if issues:
-        findings.append(Finding(fid, "fail", "fail", f"{label} {noun} out of sync ({_summarize(issues)})"))
-    else:
-        findings.append(Finding(fid, "fail", "ok", f"{label} generated {noun} in sync"))
-
-    for path, model in sorted(result["model_lines"].items()):
-        findings.append(Finding("drift-model", "info", "ok", f"{Path(path).name}: model = {model}"))
-    return findings
+        return [Finding(fid, "fail", "fail", f"{label} {noun} out of sync ({_summarize(issues)})")]
+    return [Finding(fid, "fail", "ok", f"{label} generated {noun} in sync")]
 
 
 def _summarize(issues: dict[str, list[str]]) -> str:
@@ -701,10 +694,11 @@ def render_profiles(
     """Render the resolved Profiles roster for the invoking Host; never print a key value.
 
     Host-scoped (ADR 0005/0006 as amended 2026-08-18): each Profile lists ``default_model``
-    (plus the current model line when the invoking Host's generated artifact differs — the
-    dispatch-mutable info), ``dialect``, key variable name, and PRESENT/MISSING for the
-    invoking Host's Key file ONLY — the other Host's file never appears. An unreadable
-    Registry prints one error line and exits nonzero.
+    (the generated artifact always pins it — ADR 0004 as amended 2026-08-19; a per-dispatch
+    override rides the Dispatch marker and is never on-disk state), ``dialect``, key
+    variable name, and PRESENT/MISSING for the invoking Host's Key file ONLY — the other
+    Host's file never appears. An unreadable Registry prints one error line and exits
+    nonzero.
     """
     claude = Path(claude_root) if claude_root is not None else resolve_host_root("claude")
     codex = Path(codex_root) if codex_root is not None else resolve_host_root("codex")
@@ -718,23 +712,10 @@ def render_profiles(
     except Exception as exc:  # noqa: BLE001
         return f"chinamaxM profiles: registry unreadable ({type(exc).__name__})\n", 1
 
-    from chinamaxM.generate import detect_drift
-
-    try:
-        model_lines = detect_drift(registry, {"claude": claude, "codex": codex}, host)["model_lines"]
-    except Exception:  # noqa: BLE001 - /profiles renders even if drift inspection stumbles
-        model_lines = {}
-
-    suffix = "md" if host == "claude" else "toml"
     lines = ["chinamaxM profiles", ""]
     for profile in registry.profiles.values():
         lines.append(profile.name)
         lines.append(f"  default model: {profile.default_model}")
-        raw = model_lines.get(str(root / "agents" / f"{profile.name}.{suffix}"))
-        if isinstance(raw, str) and raw:
-            bare = raw.split("/", 1)[1] if (host == "claude" and "/" in raw) else raw
-            if bare != profile.default_model:
-                lines.append(f"  current model: {bare}")
         lines.append(f"  dialect: {profile.dialect}")
         lines.append(f"  key variable: {profile.api_key_env}")
         lines.append(f"    {host} key: {'PRESENT' if _key_present(root, profile.api_key_env) else 'MISSING'}")

@@ -21,7 +21,6 @@ from chinamaxM.generate import (
     CLAUDE_MARKER,
     CODEX_MARKER,
     WORKER_INSTRUCTIONS,
-    WORKER_NAME_PREFIX,
     GenerationError,
     detect_drift,
     expected_artifacts,
@@ -29,7 +28,6 @@ from chinamaxM.generate import (
     regenerate,
     remove_provider_entries,
     resolve_roots,
-    set_model,
 )
 from chinamaxM.keyfiles import resolve_host_root
 from chinamaxM.registry import Profile, Registry, load_registry
@@ -228,32 +226,44 @@ def test_worker_instructions_point_at_lazy_mcp_discovery():
 
 
 def test_matches_generated_agent_grammar():
-    """The shared matcher accepts bare ``<profile>`` and ``chinamaxm-<profile>-<suffix>`` only.
+    """The shared matcher accepts bare ``<profile>``, ``chinamaxm-<profile>-<suffix>``
+    (Claude), and ``chinamaxm_<profile>_<suffix>`` (Codex) only.
 
-    Anchored, case-sensitive, and Registry-derived (ADR 0004 as amended 2026-08-18). This is
+    Anchored, case-sensitive, and Registry-derived (ADR 0004 as amended 2026-08-19). This is
     the single seam both Host hooks reuse, so its boundaries are pinned directly here rather
     than only through the subprocess-level host tests: the retired legacy instance form, the
-    empty-suffix / no-suffix boundaries, and the anchored substring traps must all reject.
+    empty-suffix / no-suffix boundaries, mixed separators, and the anchored substring traps
+    must all reject.
     """
     profiles = ["deepseek", "kimi", "glm"]
 
     # Accept: the bare Profile (subagent_type/role on the spawn call) and the canonical
-    # named instance form (default slug and a short custom suffix).
+    # named instance forms on each Host (default slug and a short custom suffix).
     assert matches_generated_agent("deepseek", profiles)
     assert matches_generated_agent("chinamaxm-deepseek-repo-summary", profiles)
     assert matches_generated_agent("chinamaxm-deepseek-x", profiles)
+    assert matches_generated_agent("chinamaxm_deepseek_repo_summary", profiles)
+    assert matches_generated_agent("chinamaxm_deepseek_x", profiles)
 
-    # Reject: the RETIRED legacy `<profile>-<suffix>` instance form.
+    # Reject: the RETIRED legacy `<profile>-<suffix>` instance form, in both charsets.
     assert not matches_generated_agent("deepseek-1", profiles)
+    assert not matches_generated_agent("deepseek_1", profiles)
 
-    # Reject: the two suffix boundaries — a trailing dash (empty suffix) and no suffix — so
-    # the `len(name) > len(prefix)` guard is covered directly.
-    assert not matches_generated_agent(f"{WORKER_NAME_PREFIX}deepseek-", profiles)
-    assert not matches_generated_agent(f"{WORKER_NAME_PREFIX}deepseek", profiles)
+    # Reject: the suffix boundaries — a trailing separator (empty suffix) and no suffix —
+    # so the `len(name) > len(prefix)` guard is covered directly, for both separators.
+    assert not matches_generated_agent("chinamaxm-deepseek-", profiles)
+    assert not matches_generated_agent("chinamaxm-deepseek", profiles)
+    assert not matches_generated_agent("chinamaxm_deepseek_", profiles)
+    assert not matches_generated_agent("chinamaxm_deepseek", profiles)
+
+    # Reject: mixed separators — ONE separator must be used throughout.
+    assert not matches_generated_agent("chinamaxm_deepseek-x", profiles)
+    assert not matches_generated_agent("chinamaxm-deepseek_x", profiles)
 
     # Reject: anchored substring traps (prefix must match exactly, not as a substring).
     assert not matches_generated_agent("chinamaxm-kimono-x", profiles)  # kimi vs kimono
     assert not matches_generated_agent("chinamaxm-glmax-x", profiles)  # glm vs glmax
+    assert not matches_generated_agent("chinamaxm_kimono_x", profiles)
 
     # Reject: an unknown Profile and a built-in agent name.
     assert not matches_generated_agent("chinamaxm-unknown-x", profiles)
@@ -264,7 +274,7 @@ def test_matches_generated_agent_grammar():
 
 
 def test_generation_idempotent(roots):
-    """AC-5: second run zero writes; a dispatch rewrite is reset to default on regen."""
+    """AC-5: second run zero writes; a hand-edited model line converges back on regen."""
     registry = load_registry()
     regenerate(registry, roots)
     tracked = list(expected_artifacts(registry, roots)) + [roots["codex"] / "config.toml"]
@@ -276,9 +286,13 @@ def test_generation_idempotent(roots):
     assert {p: p.stat().st_mtime_ns for p in tracked} == before_mtimes
     assert {p: p.read_bytes() for p in tracked} == before_bytes
 
-    # dispatch-style rewrite then regeneration resets ONLY that model line to default
-    set_model("claude", "deepseek", "deepseek-x")
+    # a hand-edited model line (marker intact) converges back to default on regen
     deepseek = roots["claude"] / "agents" / "deepseek.md"
+    deepseek.write_text(
+        deepseek.read_text().replace(
+            "model: deepseek/deepseek-v4-pro[1m]", "model: deepseek/deepseek-x"
+        )
+    )
     assert _frontmatter(deepseek.read_text())["model"] == "deepseek/deepseek-x"
     untouched = roots["claude"] / "agents" / "glm.md"
     untouched_mtime = untouched.stat().st_mtime_ns
@@ -319,20 +333,28 @@ def test_drift_stale_missing_foreign(roots):
     assert clean["stale"] == clean["missing"] == clean["foreign"] == clean["conflicts"] == []
 
 
-def test_drift_model_line_excepted(roots):
-    """AC-6: a dispatch-style model-line rewrite is NOT stale, surfaced in model_lines."""
+def test_drift_model_line_is_drift(roots):
+    """AC-6: model-line divergence IS drift — staleness is strict whole-content equality
+    (ADR 0004 as amended 2026-08-19: artifacts are immutable outside generation)."""
     registry = load_registry()
     regenerate(registry, roots)
-    set_model("claude", "deepseek", "deepseek-x")
-    set_model("codex", "deepseek", "deepseek-y")
+    md = roots["claude"] / "agents" / "deepseek.md"
+    toml = roots["codex"] / "agents" / "deepseek.toml"
+    md.write_text(
+        md.read_text().replace(
+            "model: deepseek/deepseek-v4-pro[1m]", "model: deepseek/deepseek-x"
+        )
+    )
+    toml.write_text(
+        toml.read_text().replace('model = "deepseek-v4-pro[1m]"', 'model = "deepseek-y"')
+    )
+    assert _frontmatter(md.read_text())["model"] == "deepseek/deepseek-x"
+    assert tomllib.loads(toml.read_text())["model"] == "deepseek-y"
 
     drift = detect_drift(registry, roots)
-    md = str(roots["claude"] / "agents" / "deepseek.md")
-    toml = str(roots["codex"] / "agents" / "deepseek.toml")
-    assert md not in drift["stale"]
-    assert toml not in drift["stale"]
-    assert drift["model_lines"][md] == "deepseek/deepseek-x"
-    assert drift["model_lines"][toml] == "deepseek-y"
+    assert str(md) in drift["stale"]
+    assert str(toml) in drift["stale"]
+    assert "model_lines" not in drift  # the info display path is retired
 
 
 def test_drift_registry_change(roots):
@@ -423,60 +445,6 @@ def test_codex_home_override_precedence(tmp_path, monkeypatch):
     regenerate(load_registry(), resolve_roots())
     assert (override / "agents" / "deepseek.toml").exists()
     assert not ambient.exists()
-
-
-# --------------------------------------------------------------------- set_model
-
-
-def test_set_model_rewrites_model_line(roots):
-    """set_model rewrites ONLY the model line on both Hosts; never validates the string."""
-    registry = load_registry()
-    regenerate(registry, roots)
-    md = roots["claude"] / "agents" / "deepseek.md"
-    toml = roots["codex"] / "agents" / "deepseek.toml"
-
-    before_md = md.read_text()
-    assert set_model("claude", "deepseek", "deepseek-x") == md
-    after_md = md.read_text()
-    assert _frontmatter(after_md)["model"] == "deepseek/deepseek-x"
-    md_diff = [
-        (a, b) for a, b in zip(before_md.split("\n"), after_md.split("\n")) if a != b
-    ]
-    assert len(before_md.split("\n")) == len(after_md.split("\n"))
-    assert len(md_diff) == 1 and md_diff[0][0].startswith("model:")
-
-    before_toml = toml.read_text()
-    set_model("codex", "deepseek", "deepseek-x")
-    after_toml = toml.read_text()
-    assert tomllib.loads(after_toml)["model"] == "deepseek-x"  # bare
-    toml_diff = [
-        (a, b) for a, b in zip(before_toml.split("\n"), after_toml.split("\n")) if a != b
-    ]
-    assert len(before_toml.split("\n")) == len(after_toml.split("\n"))
-    assert len(toml_diff) == 1 and toml_diff[0][0].startswith("model =")
-
-    # unknown profile errors naming the valid Profile list
-    with pytest.raises(GenerationError) as excinfo:
-        set_model("claude", "nope", "x")
-    assert "nope" in str(excinfo.value) and "deepseek" in str(excinfo.value)
-
-    # marker-less target file refused untouched
-    glm = roots["claude"] / "agents" / "glm.md"
-    glm.write_text("no marker here\n")
-    with pytest.raises(GenerationError):
-        set_model("claude", "glm", "x")
-    assert glm.read_text() == "no marker here\n"
-
-    # arbitrary model string with spaces/quotes lands verbatim, serializer-escaped
-    set_model("claude", "deepseek", 'weird "m" v')
-    assert _frontmatter(md.read_text())["model"] == 'deepseek/weird "m" v'
-    set_model("codex", "deepseek", 'weird "m" v')
-    assert tomllib.loads(toml.read_text())["model"] == 'weird "m" v'
-
-    # regeneration resets both model lines to the Profile default
-    regenerate(registry, roots)
-    assert _frontmatter(md.read_text())["model"] == "deepseek/deepseek-v4-pro[1m]"
-    assert tomllib.loads(toml.read_text())["model"] == "deepseek-v4-pro[1m]"
 
 
 # ------------------------------------------------- host-scoped generation (ADR 0004 amended)

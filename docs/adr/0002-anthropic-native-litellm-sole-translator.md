@@ -114,6 +114,31 @@ merged into them. The hoist is a deterministic pure function of the item-list pr
 append-only and prefix-cache stability hold; run isolation (one litellm transform per
 run) is unchanged.
 
+**Amended 2026-08-19 (the Seam translates `agent_message` items; marker substitution and
+the prefix strip ride the shared mutation funnel).** Codex's direct collab tools (parents
+like gpt-5.6-sol) deliver a child's task as an `agent_message` input item, which the Seam
+400'd (pre-existing Bug A, live-confirmed 2026-08-19). The Seam now normalizes both live
+shapes to a plain `message` item before the ordinary message path (never a parallel
+builder): an `agent_message` with a `content` list (the delivered task) becomes a USER
+message; one with a string `message` field (a rollout self-output, `phase:
+"commentary"|"final_answer"`) becomes an ASSISTANT message with one text part. Any other
+shape stays a 400. Two funnel changes ride along (cross-ref ADR 0004 as amended
+2026-08-19): `mutate_body`'s prefix strip is now profile-scoped (only a `<profile>/`
+prefix naming the routed Profile is stripped), so a bare Responses model containing `/`
+crosses the Seam verbatim and the Seam's defensive model restore is deleted; and the
+Dispatch-marker substitution runs as `mutate_body`'s final step, so the Seam egress model
+follows the marker exactly as the relay and count_tokens do. Prefix-cache stability is
+unaffected: the marker is constant text inside the message history, the substitution is a
+deterministic function of that history, and the byte tests (ADR 0011) pin it.
+Live-verified 2026-08-19 (isolated `CODEX_HOME`, gpt-5.6-sol parent, real DeepSeek): the
+child's requests carried both `agent_message` shapes and every one 200'd through the Seam
+where the pre-fix Seam 400'd on the first. Documented host limitation, not a Seam bug: a
+direct-collab (sol-parent) NEW_TASK delivers its payload as an `encrypted_content` part
+only Codex-native models can decrypt — the Seam forwards the plaintext parts, so a
+chinamaxM Worker sees the NEW_TASK framing but an empty payload (and no Dispatch marker).
+Dispatching chinamaxM Workers should ride the exec-sandbox `spawn_agent` path (the
+`chinamaxM-task` skill's flow), which delivers the task — marker included — in plaintext.
+
 **Kimi-k3 Responses bug (now precisely located).** litellm has NO Responses config for
 moonshot: a Responses-path call for kimi silently degrades to a **chat-completions**
 egress (untracked in upstream issue #33921; kimi-k3 absent from litellm's model map).

@@ -143,12 +143,16 @@ its report is printed straight back to you.
 Arguments:
 - `profile=<name>` — **required**. One of: `deepseek`, `mimo`, `glm`, `minimax`, `kimi`,
   `qwen`.
-- `model=<any string>` — optional. Overrides the profile's default model. The string goes
-  straight to the provider and is never checked, so a typo comes back as the provider's own
-  error.
-- `name=<worker>` — optional. Must be `chinamaxm-<profile>-<suffix>` (e.g.
-  `chinamaxm-deepseek-review`). Defaults to a task-descriptive name derived from your
-  prompt, like `chinamaxm-deepseek-repo-summary`.
+- `model=<any string>` — optional. Overrides the profile's default model **for this one
+  dispatch only**: the override rides along in the worker's own task (a marker line the
+  proxy reads), so no installed file is ever edited, it takes effect from the worker's very
+  first request, and it disappears with the worker. The string goes straight to the
+  provider and is never checked, so a typo comes back as the provider's own error.
+- `name=<worker>` — optional. On Claude Code it must be `chinamaxm-<profile>-<suffix>`
+  (e.g. `chinamaxm-deepseek-review`); on Codex, underscores instead of hyphens —
+  `chinamaxm_<profile>_<suffix>` (Codex rejects hyphenated agent names). Defaults to a
+  task-descriptive name derived from your prompt, like `chinamaxm-deepseek-repo-summary`
+  (`chinamaxm_deepseek_repo_summary` on Codex).
 
 Examples:
 ```

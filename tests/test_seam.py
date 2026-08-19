@@ -655,3 +655,119 @@ async def test_nonstreaming_response_translation(make_seam_client):
     truncated_obj = await truncated.json()
     assert truncated_obj["status"] == "incomplete"
     assert truncated_obj["incomplete_details"]["reason"] == "max_output_tokens"
+
+
+# ------------------------------------- agent_message items (ADR 0002 amended 2026-08-19)
+
+
+async def test_agent_message_content_shape_becomes_user_message(make_seam_client):
+    """A direct-collab task delivery (agent_message with a content list) ⇒ a user message."""
+    client, fake = await make_seam_client("deepseek")
+    fake.respond(headers=JSON_HEADERS, body=message_bytes([{"type": "text", "text": "ok"}]))
+
+    delivered = {
+        "type": "agent_message",
+        "author": "gpt-5.6-sol",
+        "recipient": "chinamaxm_deepseek_task",
+        "content": [{"type": "input_text", "text": "summarize the repo"}],
+    }
+    response = await client.send({"model": "deepseek-v4-pro[1m]", "input": [delivered]})
+    assert response.status == 200
+
+    messages = json.loads(fake.requests[0].body)["messages"]
+    assert messages[0]["role"] == "user"
+    assert "summarize the repo" in json.dumps(messages[0]["content"])
+
+
+async def test_agent_message_string_shape_becomes_assistant_message(make_seam_client):
+    """A rollout self-output (agent_message with a string message field) ⇒ an assistant message."""
+    client, fake = await make_seam_client("deepseek")
+    fake.respond(headers=JSON_HEADERS, body=message_bytes([{"type": "text", "text": "ok"}]))
+
+    items = [
+        user_text("do the task"),
+        {"type": "agent_message", "message": "interim commentary", "phase": "commentary"},
+        user_text("continue"),
+    ]
+    response = await client.send({"model": "deepseek-v4-pro[1m]", "input": items})
+    assert response.status == 200
+
+    messages = json.loads(fake.requests[0].body)["messages"]
+    assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+    assert "interim commentary" in json.dumps(messages[1]["content"])
+
+
+async def test_agent_message_neither_shape_and_unknown_types_400(make_seam_client):
+    """An agent_message with neither shape, and any unknown item type, still 400 upstream-free."""
+    client, fake = await make_seam_client("deepseek")
+
+    response = await client.send(
+        {"model": "deepseek-v4-pro[1m]", "input": [{"type": "agent_message", "phase": "x"}]}
+    )
+    assert response.status == 400
+    assert (await response.json())["error"]["type"] == "invalid_request_error"
+
+    response = await client.send(
+        {"model": "deepseek-v4-pro[1m]", "input": [{"type": "bogus_item"}]}
+    )
+    assert response.status == 400
+    assert fake.requests == []  # nothing reached the provider
+
+
+# --------------------------------------- Dispatch marker on the Seam (ADR 0004 amended)
+
+
+async def test_marker_found_past_injected_first_user_item(make_seam_client):
+    """The real Codex shape: an injected first user item precedes the task, so the marker
+    lands in the SECOND user message — scanning all user messages still finds it."""
+    client, fake = await make_seam_client("deepseek")
+    fake.respond(headers=JSON_HEADERS, body=message_bytes([{"type": "text", "text": "ok"}]))
+
+    items = [
+        user_text("<recommended_plugins>injected host preamble</recommended_plugins>"),
+        user_text("[chinamaxm model=deepseek-v4-flash]\n\nsummarize the repo"),
+    ]
+    response = await client.send({"model": "deepseek-v4-pro[1m]", "input": items})
+    assert response.status == 200
+
+    sent = json.loads(fake.requests[0].body)
+    assert sent["model"] == "deepseek-v4-flash"
+    # The marker text itself still rides in the translated body.
+    assert "[chinamaxm model=deepseek-v4-flash]" in json.dumps(sent["messages"])
+
+
+async def test_bare_model_with_slash_never_mangled(make_seam_client):
+    """A bare Responses model containing '/' crosses the Seam verbatim (the prefix strip is
+    profile-scoped — this replaces the retired defensive model restore)."""
+    client, fake = await make_seam_client("glm")
+    fake.respond(headers=JSON_HEADERS, body=message_bytes([{"type": "text", "text": "ok"}]))
+
+    response = await client.send({"model": "org/model-x", "input": [user_text("hi")]})
+    assert response.status == 200
+    assert json.loads(fake.requests[0].body)["model"] == "org/model-x"
+
+
+async def test_prefix_stability_across_turns_with_marker(make_seam_client):
+    """Two Seam turns with a marker present: the model substitution is deterministic and the
+    translated history stays a strict byte prefix (provider cache holds)."""
+    client, fake = await make_seam_client("glm")
+    fake.respond(headers=JSON_HEADERS, body=message_bytes([{"type": "text", "text": "ok"}]))
+
+    task = user_text("[chinamaxm model=glm-5.2-flash]\n\ndo the task")
+    turn_n = [task]
+    turn_n1 = [task, assistant_text("done step 1"), user_text("continue")]
+
+    await client.send({"model": "glm-5.2", "input": turn_n})
+    await client.send({"model": "glm-5.2", "input": turn_n1})
+
+    body_n = json.loads(fake.requests[0].body)
+    body_n1 = json.loads(fake.requests[1].body)
+    assert body_n["model"] == "glm-5.2-flash"
+    assert body_n1["model"] == "glm-5.2-flash"  # same first match every turn
+
+    messages_n = body_n["messages"]
+    messages_n1 = body_n1["messages"]
+    assert messages_n == messages_n1[: len(messages_n)]  # strict list prefix
+    serialized_n = json.dumps(messages_n, separators=(",", ":"))
+    serialized_n1 = json.dumps(messages_n1, separators=(",", ":"))
+    assert serialized_n1.startswith(serialized_n[:-1])

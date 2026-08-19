@@ -34,3 +34,17 @@ strip-and-forward, slash-prefixed-unknown-profile ⇒ local 404 with the valid l
 prefixless/unparseable ⇒ byte-for-byte Default branch. No glob or model-list matching
 exists to test, and no test may assert any model-string validation — model strings are
 opaque pass-through everywhere.
+
+**Amended 2026-08-19 (Dispatch-marker and agent_message test families — cross-ref ADRs
+0002/0004/0010 as amended 2026-08-19).** The suite gains: relay-branch marker tests
+(substitution from request 1, first-match-wins across user messages, greedy capture
+keeping a `[1m]`-suffixed ID, marker kept in the forwarded body, no-marker ⇒ unchanged,
+line-anchoring rejecting inline mentions, effective model in the JSONL line, count_tokens
+counting the marker-substituted bytes, and the Default branch NEVER scanned — the
+byte-for-byte test stays green with a marker in the body); Seam tests (`agent_message`
+content-list ⇒ user message, string-`message` ⇒ assistant message, neither/unknown ⇒ 400,
+the marker found past an injected first user item — the real Codex shape — a bare model
+containing `/` never mangled, and prefix-stability bytes across turns with a marker
+present); matcher tests for both per-Host name grammars; and strict-drift tests (a
+model-line edit IS drift; the `model_lines` display path is gone). The retired
+`set_model` tests are deleted with the machinery.

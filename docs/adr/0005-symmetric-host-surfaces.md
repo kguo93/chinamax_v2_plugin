@@ -167,3 +167,26 @@ Hosts. The symmetric-surface guarantee is unchanged — both task surfaces carry
 grammar; only the grammar itself moved. See ADR 0004 (as amended 2026-08-18) for the matcher
 and rationale, and ADR 0007 (as amended 2026-08-18) for the report-delivery duty added to the
 same surfaces in this pass.
+
+**Amended 2026-08-19 (`model=` rides the Dispatch marker; `/profiles` shows the default
+only; Codex name grammar — cross-ref ADR 0004 as amended 2026-08-19).** Three earlier
+sentences here are superseded.
+
+- The 2026-08-13 amendment read: "Dispatch rewrites the Generated agent's model line
+  (ADR 0004), spawns it". **Reversed**: `model=<any string>` GIVEN now means the dispatch
+  surface prepends the Dispatch-marker line `[chinamaxm model=<model>]` (plus one blank
+  line) to the Worker's spawn prompt and spawns — no file is ever touched, no rewrite
+  helper exists (the `set_model` launcher verb is retired). The override is per-dispatch;
+  everything else in that amendment (never validated, verbatim provider-error relay,
+  unknown-profile error) is unchanged.
+- The 2026-08-13 doctor adjustment read: "the generated-agent sync check compares content
+  excluding the dispatch-mutable model line (ADR 0004), reporting the current model as
+  info". **Reversed**: the sync check is strict whole-content equality, model line
+  included; no model-line info rows exist.
+- `/profiles` lists the Registry `default_model` only — the "current model after rewrite"
+  display path is retired (artifacts always pin the default).
+- The 2026-08-18 name-grammar amendment's "both Hosts" clause is superseded on Codex only:
+  a Codex instance name is `chinamaxm_<profile>_<suffix>` (lowercase `[a-z0-9_]` — Codex
+  0.147 rejects hyphenated agent names); Claude keeps `chinamaxm-<profile>-<suffix>`. The
+  surfaces stay symmetric in verbs and semantics; the separator charset is a Host-specific
+  workaround inside the symmetric surface, exactly like the steering mediation above.

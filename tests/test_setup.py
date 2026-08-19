@@ -1427,7 +1427,7 @@ def test_launcher_macos_stub_guard(tmp_path):
     clt_bin = tmp_path / "cltbin"
     _fake_exe(clt_bin / "uname", "Darwin")
     _fake_exe(clt_bin / "xcode-select", "/Library/Developer/CommandLineTools")
-    r = _run_launcher(base_env, args=("set_model",), path=f"{clt_bin}:/usr/bin:/bin")
+    r = _run_launcher(base_env, args=("doctor",), path=f"{clt_bin}:/usr/bin:/bin")
     assert "no usable Python 3" not in r.stderr
 
     # (3) python3 resolving anywhere OTHER than /usr/bin/python3 ⇒ accepted without any

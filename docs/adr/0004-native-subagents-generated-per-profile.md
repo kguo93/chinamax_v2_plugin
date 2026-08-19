@@ -139,3 +139,50 @@ A dual-Host machine gets each side's artifacts from that side's own setup run. T
 artifact model itself is untouched (ONE artifact per Profile per Host, dispatch-mutable
 model line, reserved names enforced at Registry load for both Hosts), and doctor's sync
 check likewise inspects only the invoking Host's artifacts (ADR 0005).
+
+**Amended 2026-08-19 (Dispatch marker replaces the dispatch-time model rewrite; artifacts
+are immutable outside generation; Codex instance names use underscores).** The 2026-08-13
+amendment read: "**The model line is dispatch-mutable state.** … A dispatch with an
+explicit model REWRITES that artifact's model line — `<profile>/<M>` on Claude, bare `M`
+on Codex — then spawns … (a) 'regeneration is the only edit path' gains exactly one
+sanctioned sibling — the dispatch-time model-line rewrite; (b) the drift check compares
+generated content EXCEPT the model value, which doctor reports as info, never drift;
+(c) regeneration (SessionStart hook, setup) resets model lines to `default_model`; (d) the
+host MUST re-read the artifact at spawn time … the rewrite→spawn race window is
+per-dispatch and accepted." **Reversed in full** (operator grilling 2026-08-19,
+canary-proven on both Hosts): the host serves a cached agent definition, so the first
+spawn after a rewrite rode the PREVIOUS model (official docs confirm mid-session agent-.md
+edits neither invalidate the main prompt cache nor take effect until restart / `/clear` /
+`/compact` — hot-reload is open upstream as claude-code #22050/#23608), and editing
+installed artifacts was never kosher. The replacement is the **Dispatch marker**: when
+`model=` is given, the dispatch surface prepends the line `[chinamaxm model=<model>]`
+(plus one blank line) to the Worker's spawn prompt; the Proxy's shared mutation funnel
+(`mutate_body`) scans user-role messages in order — first match wins, matched line-anchored
+with a greedy capture so `[1m]`-suffixed IDs survive — and substitutes the egress model on
+the Anthropic-ingress relay, count_tokens, and the Seam. The marker text is KEPT in the
+forwarded body; the Default branch is never scanned (ADR 0001's byte-for-byte guarantee is
+untouched). Consequences:
+
+- The generated artifact's model line is **immutable outside generation**; "regeneration is
+  the only edit path" holds again with NO sibling. `set_model` (module, launcher verb,
+  generation helpers) is retired with no escape hatch.
+- Drift is **strict whole-content equality**, model line included; the doctor `model_lines`
+  info display and the `/profiles` "current model" row are retired (the artifact always
+  pins `<profile>/<default_model>` / bare `default_model`).
+- The override is **per-dispatch, per-instance**: it lives and dies with that Worker;
+  steering cannot change a Worker's model mid-run (the spawn marker is always the first
+  match). The model string remains never-validated; provider failures relay verbatim.
+- Caveat (accepted, documented): Claude Code subagents auto-compact near context capacity,
+  and whether the spawn prompt survives compaction verbatim is undocumented — if it does
+  not, a compacted Worker's later requests fall back to `default_model` mid-run. Marker-
+  shaped text elsewhere in user context could only fire when no dispatch marker precedes it
+  (first-match-wins shields every marker-bearing dispatch; edge case verified absent on the
+  reference machine).
+- **Codex instance-name grammar** (supersedes the 2026-08-18 hyphen grammar on Codex ONLY):
+  Codex 0.147 rejects hyphenated agent names (`[a-z0-9_]` required), so a Codex Worker
+  instance is `chinamaxm_<profile>_<suffix>` (default `chinamaxm_<profile>_<task_slug>`,
+  numeric fallback, same occupancy rules). Claude keeps `chinamaxm-<profile>-<suffix>`. The
+  shared matcher `matches_generated_agent` accepts exactly the bare `<profile>` plus BOTH
+  full forms, one separator used throughout; shipped Profile names are `[a-z0-9]`-only, so
+  the two grammars are never ambiguous. Cross-ref ADR 0002/0005/0007/0010/0011 (as amended
+  2026-08-19).

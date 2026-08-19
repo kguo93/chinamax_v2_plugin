@@ -61,7 +61,8 @@ A native host subagent (Claude subagent or Codex role child) generated from a Pr
 _Avoid_: Job, Bridge Agent, Runtime worker (old architecture)
 
 **Worker name**:
-The address of a dispatched Worker instance: `chinamaxm-<profile>-<suffix>`, where the
+The address of a dispatched Worker instance: `chinamaxm-<profile>-<suffix>` on Claude,
+`chinamaxm_<profile>_<suffix>` on Codex (whose agent names reject hyphens), where the
 suffix is a short task-descriptive slug (or a numeric fallback when the task yields none).
 Distinct from the Generated agent, which is named for the bare Profile. Steering and
 continuation address a Worker by this name.
@@ -69,7 +70,10 @@ _Avoid_: a bare Profile-indexed name (`deepseek-1`) — retired; it named neithe
 nor the task.
 
 **Generated agent**:
-A thin, setup-generated artifact — a Claude agent `.md` or a Codex role TOML — ONE per Profile, never hand-maintained. Its model line is dispatch-mutable state: `/task model=…` rewrites it before spawning, and regeneration resets it to the Profile's default. All other drift from the Registry is a doctor finding; regeneration and the dispatch-time model-line rewrite are the only edit paths.
+A thin, setup-generated artifact — a Claude agent `.md` or a Codex role TOML — ONE per Profile, never hand-maintained and immutable outside generation: regeneration is the ONLY edit path, and any divergence from the Registry (model line included) is drift. A per-dispatch model override never touches the artifact — it rides the Dispatch marker.
+
+**Dispatch marker**:
+The per-dispatch model-override line a dispatch surface prepends to a Worker's spawn prompt when `model=` is given. The Proxy reads it from the conversation itself and substitutes the egress model for that Worker instance; no file changes, and the override lives and dies with the dispatch.
 
 **Worker contract**:
 The hook-injected rules riding every Worker spawn on both Hosts: the Worker must end with a complete final report, and the parent must print that report verbatim.
