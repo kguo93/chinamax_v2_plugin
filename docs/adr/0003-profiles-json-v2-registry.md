@@ -32,7 +32,7 @@ Overlay at `~/.claude/chinamaxM/profiles.json` (same merge semantics as the old 
 | profile | anthropic endpoint | default model | key var | thinking policy |
 |---|---|---|---|---|
 | deepseek | api.deepseek.com/anthropic | deepseek-v4-pro[1m] | DEEPSEEK_API_KEY | extra_body.reasoning.effort=max |
-| mimo | api.xiaomimimo.com/anthropic | mimo-v2.5-pro | MIMO_API_KEY | extra_body.reasoning_effort=high |
+| mimo | api.xiaomimimo.com/anthropic | mimo-v2.5 | MIMO_API_KEY | extra_body.reasoning_effort=high |
 | glm | api.z.ai/api/anthropic | glm-5.2 | GLM_API_KEY | thinking:{type:enabled} |
 | minimax | api.minimax.io/anthropic | MiniMax-M3[1m] | MINIMAX_API_KEY | thinking:{type:adaptive} |
 | kimi | api.moonshot.ai/anthropic | kimi-k3 | KIMI_API_KEY | extra_body.reasoning_effort=max |
@@ -98,3 +98,10 @@ registry pinned; mutation order and extras guard recorded).**
   clear error, never generated.
 - The Overlay path resolves under the canonical root chain of ADR 0006 (as amended
   2026-08-13), not a hardcoded `~/.claude`.
+
+**Amended 2026-08-19 (mimo default model changed).**
+
+- The mimo Profile's shipped `default_model` was `mimo-v2.5-pro`; it is now
+  **`mimo-v2.5`**. The table above carries the new pin. Endpoint, key var, thinking
+  policy, and scrub are unchanged; the 2026-08-13 live-verification note above was
+  performed against the old pin.

@@ -18,7 +18,7 @@
       "dialect": "anthropic",
       "base_url": "https://api.xiaomimimo.com/anthropic",
       "api_key_env": "MIMO_API_KEY",
-      "default_model": "mimo-v2.5-pro",
+      "default_model": "mimo-v2.5",
       "thinking": {"extra_body": {"reasoning_effort": "high"}},
       "scrub": ["cache_control", "output_config"],
       "request_extras": {},
