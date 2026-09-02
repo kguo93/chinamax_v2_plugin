@@ -29,7 +29,7 @@
       "dialect": "anthropic",
       "base_url": "https://api.z.ai/api/anthropic",
       "api_key_env": "GLM_API_KEY",
-      "default_model": "glm-5.2",
+      "default_model": "glm-5.3",
       "thinking": {"thinking": {"type": "enabled"}},
       "scrub": ["cache_control", "output_config"],
       "request_extras": {},

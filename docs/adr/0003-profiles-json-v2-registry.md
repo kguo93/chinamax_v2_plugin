@@ -33,7 +33,7 @@ Overlay at `~/.claude/chinamaxM/profiles.json` (same merge semantics as the old 
 |---|---|---|---|---|
 | deepseek | api.deepseek.com/anthropic | deepseek-v4-pro[1m] | DEEPSEEK_API_KEY | extra_body.reasoning.effort=max |
 | mimo | api.xiaomimimo.com/anthropic | mimo-v2.5 | MIMO_API_KEY | extra_body.reasoning_effort=high |
-| glm | api.z.ai/api/anthropic | glm-5.2 | GLM_API_KEY | thinking:{type:enabled} |
+| glm | api.z.ai/api/anthropic | glm-5.3 | GLM_API_KEY | thinking:{type:enabled} |
 | minimax | api.minimax.io/anthropic | MiniMax-M3[1m] | MINIMAX_API_KEY | thinking:{type:adaptive} |
 | kimi | api.moonshot.ai/anthropic | kimi-k3 | KIMI_API_KEY | extra_body.reasoning_effort=max |
 | qwen | dashscope-intl.aliyuncs.com/apps/anthropic | qwen3.8-max | QWEN_API_KEY | thinking:{type:enabled} |
@@ -105,3 +105,13 @@ registry pinned; mutation order and extras guard recorded).**
   **`mimo-v2.5`**. The table above carries the new pin. Endpoint, key var, thinking
   policy, and scrub are unchanged; the 2026-08-13 live-verification note above was
   performed against the old pin.
+
+**Amended 2026-09-02 (glm default model changed).**
+
+- The glm Profile's shipped `default_model` was `glm-5.2`; it is now **`glm-5.3`** (GA
+  2026-08-18). The table above carries the new pin. Live-verified through the Proxy the
+  same day: plain `glm/glm-5.3` accepted with the shipped thinking policy honored. The
+  `glm-5.3[1m]` variant was REJECTED upstream (Z.AI error 1214 — the anthropic dialect
+  relays the model string byte-for-byte after prefix strip), so the pin stays a plain
+  model string with no `context_window` map. Endpoint, key var, thinking policy, and
+  scrub are unchanged.
