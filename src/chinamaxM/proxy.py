@@ -736,20 +736,26 @@ def _hop_by_hop(headers: CIMultiDict) -> set[str]:
 
 
 def _forward_request_headers(headers: CIMultiDict) -> CIMultiDict:
-    """Copy inbound request headers minus hop-by-hop, ``Host`` and ``Content-Length``.
+    """Copy inbound request headers minus hop-by-hop, ``Host``, ``Content-Length`` and
+    ``Accept-Encoding``; pin ``Accept-Encoding: identity``.
 
     ``Host`` is dropped so the client library regenerates it for the upstream URL, and
     ``Content-Length`` so the client recomputes framing for both the buffered-bytes and
     streamed-body paths (the body bytes are unchanged — only framing is recomputed).
-    Everything else (auth and ``anthropic-*`` included) forwards verbatim.
+    ``Accept-Encoding`` is pinned to ``identity`` (ADR 0001 as amended 2026-09-19): the
+    Proxy re-chunks the upstream response over HTTP/1.1, and Claude Code's Bun inflater
+    intermittently fails on a gzip SSE stream framed that way (``ZlibError``), so the
+    upstream is asked for uncompressed bytes. Everything else (auth and ``anthropic-*``
+    included) forwards verbatim.
     """
     hop = _hop_by_hop(headers)
     out: CIMultiDict = CIMultiDict()
     for name, value in headers.items():
         lowered = name.lower()
-        if lowered in hop or lowered in ("host", "content-length"):
+        if lowered in hop or lowered in ("host", "content-length", "accept-encoding"):
             continue
         out.add(name, value)
+    out.add("accept-encoding", "identity")
     return out
 
 

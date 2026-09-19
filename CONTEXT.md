@@ -18,7 +18,7 @@ _Avoid_: endpoint (reserve for provider-side URLs)
 The routing key on the Anthropic ingress: a worker-bound model string is `<profile>/<model>`, split on the first `/`. The Proxy routes by the prefix, strips it, and forwards the bare model string verbatim — model strings are never validated anywhere; the provider is the sole authority, and its errors relay back unrewritten. (The Responses ingress carries the Profile in its path instead.)
 
 **Default branch**:
-The route for a request whose model string carries no Profile prefix (or whose body is unparseable or model-less): byte-for-byte passthrough to api.anthropic.com — body unserialized, auth and beta headers untouched. Claude main and native Claude subagents always ride this branch. A slash-prefixed but UNKNOWN profile — on either ingress — gets a local 404 naming the valid Profile list, never passthrough.
+The route for a request whose model string carries no Profile prefix (or whose body is unparseable or model-less): byte-for-byte passthrough to api.anthropic.com — body unserialized, auth and beta headers untouched (the one exception: `Accept-Encoding` is pinned to `identity` upstream, ADR 0001 as amended 2026-09-19). Claude main and native Claude subagents always ride this branch. A slash-prefixed but UNKNOWN profile — on either ingress — gets a local 404 naming the valid Profile list, never passthrough.
 _Avoid_: fallback (nothing failed; this is the normal Claude path)
 
 **Relay branch**:

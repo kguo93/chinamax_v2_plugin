@@ -201,6 +201,11 @@ codex plugin marketplace upgrade
 codex plugin add chinamaxm@chinamaxm-plugin
 ```
 
+The already-running proxy keeps serving the old code until it is restarted (Linux:
+`systemctl --user restart chinamaxM`; macOS/Windows: restart the `chinamaxM` service).
+0.3.2 fixes the intermittent `API Error: ZlibError` Claude Code raised through the proxy:
+the Default branch now asks Anthropic for uncompressed responses.
+
 ## Uninstall / teardown
 
 Run `/chinamaxm:setup` and choose teardown. It is host-scoped: inside Claude it removes the

@@ -104,11 +104,18 @@ async def test_unmatched_messages_pass_through_byte_identical(proxy_client, fake
     assert recorded.headers["Host"] == yarl.URL(fake_provider.url).authority
     for name, value in sent.items():
         assert recorded.headers[name] == value
-    # The Proxy added no headers the client did not send.
-    for banned in ("User-Agent", "Accept", "Accept-Encoding", "Content-Type"):
+    # The Proxy added no headers the client did not send, except the pinned
+    # Accept-Encoding: identity (ADR 0001 as amended 2026-09-19).
+    for banned in ("User-Agent", "Accept", "Content-Type"):
         assert banned not in recorded.headers
-    # Received == sent (explicit) plus at most recomputed Host/Content-Length.
-    leftover = [n.lower() for n in recorded.headers if n.lower() not in ("host", "content-length")]
+    assert recorded.headers["Accept-Encoding"] == "identity"
+    # Received == sent (explicit) plus at most recomputed Host/Content-Length and the
+    # pinned Accept-Encoding.
+    leftover = [
+        n.lower()
+        for n in recorded.headers
+        if n.lower() not in ("host", "content-length", "accept-encoding")
+    ]
     assert sorted(leftover) == sorted(sent)
 
     # Response reached the client byte-identical (header equality minus Date/Server).
@@ -315,6 +322,32 @@ async def test_encoded_response_passes_through(proxy_client, fake_provider):
     received = await response.read()
     assert received == encoded
     assert gzip.decompress(received) == raw
+
+
+async def test_default_branch_pins_accept_encoding_identity(proxy_client, fake_provider):
+    """ADR 0001 as amended 2026-09-19: the Default branch replaces the client's
+    ``Accept-Encoding`` with ``identity`` on the routed and the non-routed path alike.
+
+    Claude Code (Bun) sends ``gzip, deflate, br, zstd``; forwarded verbatim, the upstream
+    gzips the SSE stream, the Proxy re-chunks it, and Bun's inflater intermittently raises
+    ``ZlibError``. Pinning identity upstream removes the trigger.
+    """
+    bun = {"Accept-Encoding": "gzip, deflate, br, zstd"}
+
+    fake_provider.respond(status=200, headers={"content-type": "application/json"}, body=b"{}")
+    response = await proxy_client.post(
+        "/v1/messages",
+        data=json.dumps({"model": "claude-opus-5"}).encode(),
+        headers=bun,
+        skip_auto_headers=["Content-Type"],
+    )
+    assert response.status == 200
+    assert fake_provider.requests[-1].headers.getall("Accept-Encoding") == ["identity"]
+
+    fake_provider.respond(status=200, body=b"models-list")
+    response = await proxy_client.get("/v1/models", headers=bun)
+    assert response.status == 200
+    assert fake_provider.requests[-1].headers.getall("Accept-Encoding") == ["identity"]
 
 
 def test_hermetic_guard_blocks_nonloopback_and_clears_keys():

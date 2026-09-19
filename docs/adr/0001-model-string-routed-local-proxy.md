@@ -73,3 +73,20 @@ byte-for-byte". Both clauses are **reversed** as follows:
   `anthropic-beta`, forward `anthropic-version` or default it to `2023-06-01`, replace
   auth per ADR 0006, and drop hop-by-hop headers. The Default branch continues to pass
   every header untouched.
+
+**Amended 2026-09-19 (ZlibError: Default branch pins `Accept-Encoding: identity`).** The
+original decision's "auth and `anthropic-beta` headers untouched" and the review note
+"The Default branch continues to pass every header untouched" are **narrowed** by one
+header: the Default branch now drops the inbound `Accept-Encoding` and sends
+`Accept-Encoding: identity` upstream, exactly as the Relay branch already does. Every
+other header (auth, `anthropic-*`, everything else) and the body stay byte-for-byte.
+Why: Claude Code 2.1.276 (Bun 1.4.3) sends `Accept-Encoding: gzip, deflate, br, zstd`;
+forwarded verbatim, api.anthropic.com gzips the SSE stream, the Proxy re-chunks that
+stream over HTTP/1.1, and Bun's inflater intermittently fails with
+`ZlibError fetching "http://127.0.0.1:8402/v1/messages?beta=true"` (5 of 37 live runs;
+the relayed gzip bytes were valid — Python inflated the captured stream to EOF — so the
+Proxy's framing is the trigger, not corruption). Live A/B on 2026-09-18: 0 of 32 runs
+failed with the pin, 0 of 32 with the proxy inflating instead; the pin is the smaller
+change and reuses the Relay-branch policy. An upstream that ignores the pin and encodes
+anyway still passes through raw (`auto_decompress=False`, `Content-Encoding` kept).
+`CONTEXT.md`'s "Default branch" entry is amended in step.
