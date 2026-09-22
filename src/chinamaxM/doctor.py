@@ -328,6 +328,10 @@ def check_service(ctx: DoctorContext) -> list[Finding]:
         log_dir=ctx.claude_root / "chinamaxM",
     )
     st = ctx.service_status(cfg)  # a raise here becomes a content-free 'error' Finding
+    if st.failure_reason:
+        return [Finding("service", "fail", "fail", st.failure_reason)]
+    if st.installed and st.enabled and st.waiting_reason:
+        return [Finding("service", "info", "ok", st.waiting_reason)]
     ok = bool(st.installed and st.enabled and st.running)
     detail = f"installed={st.installed} enabled={st.enabled} running={st.running}"
     return [Finding("service", "fail", "ok" if ok else "fail", detail)]
@@ -340,6 +344,14 @@ def check_port(ctx: DoctorContext) -> list[Finding]:
     port = ctx.registry.port
     if ctx.port_probe(port):
         return [Finding("port", "fail", "ok", f"proxy port {port} is listening")]
+    from chinamaxM.ops.supervision import SupervisionConfig
+
+    st = ctx.service_status(SupervisionConfig(
+        python_path=sys.executable, entry=["-m", "chinamaxM.proxy"],
+        port=port, log_dir=ctx.claude_root / "chinamaxM",
+    ))
+    if st.installed and st.enabled and st.waiting_reason:
+        return [Finding("port", "info", "ok", st.waiting_reason)]
     return [Finding("port", "fail", "fail", f"proxy port {port} is not listening")]
 
 
@@ -562,7 +574,7 @@ def check_linger(ctx: DoctorContext) -> list[Finding]:
     from chinamaxM.ops.supervision import linger_enabled
 
     state = "PRESENT" if linger_enabled() else "ABSENT"
-    return [Finding("linger", "info", "ok", f"Linux linger: {state}")]
+    return [Finding("linger", "info", "ok", f"Linux linger: {state} (unchanged; Proxy startup follows GNOME login)")]
 
 
 # --------------------------------------------------------------------------- engine

@@ -88,7 +88,7 @@ agents are picked up.
 
 Host-scoped: removes OUR generated `model_providers.chinamaxM-*` entries from
 `~/.codex/config.toml`, the shared Proxy service, and the recorded interpreter; keys, agents,
-and Linux linger are left in place. The Proxy service is SHARED — if Claude was also wired,
+and existing account-wide Linux linger are left in place. The Proxy service is SHARED — if Claude was also wired,
 tearing down here removes its Proxy too, and the report says so (run teardown inside Claude to
 remove its env flip).
 
@@ -116,3 +116,8 @@ remove its env flip).
   `--winsw-service-password-file <path>` to supply the service-account password (read from the
   file, never logged). NOTE: the Windows path is NOT live-verified on a real Windows host in this
   build (mocked-tested only).
+
+On Linux, setup installs a GNOME-session timer: start the Proxy after 60 seconds, stop
+it on logout, and recover crashes after 3 seconds. Existing running Proxies are preserved
+during migration. Setup does not enable linger. Pending login/countdown states are
+reported as informational; requested live probes are deferred until startup completes.

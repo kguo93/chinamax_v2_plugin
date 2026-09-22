@@ -696,3 +696,39 @@ def test_normalize_flip_url_shapes():
     assert normalize_flip_url("http://[::1]:8402").is_loopback
     assert not normalize_flip_url("http://10.0.0.1:8402").is_loopback
     assert normalize_flip_url("http://127.0.0.1:notaport").port is None
+
+
+@pytest.mark.parametrize("reason", ["waiting for GNOME login", "waiting for the 60-second GNOME login timer"])
+def test_login_wait_is_informational(install, reason):
+    """A healthy scheduled startup is not a broken service or listening port."""
+    findings, code = run(
+        install, port_probe=lambda port: False,
+        service_status=lambda cfg: SupervisionStatus(True, True, False, False, reason),
+    )
+    assert code == 0
+    for fid in ("service", "port"):
+        finding = one(findings, fid)
+        assert finding.level == "info" and finding.detail == reason
+
+
+def test_wait_cannot_hide_missing_installation(install):
+    """A malformed status with a waiting reason still fails for absent artifacts."""
+    findings, code = run(
+        install, port_probe=lambda port: False,
+        service_status=lambda cfg: SupervisionStatus(False, True, False, False, "waiting for GNOME login"),
+    )
+    assert code == 1
+    assert one(findings, "service").status == "fail"
+    assert one(findings, "port").status == "fail"
+
+
+def test_failed_timer_is_reported_even_while_proxy_runs(install):
+    """A live Proxy does not excuse failure of its next-login supervision."""
+    findings, code = run(
+        install,
+        service_status=lambda cfg: SupervisionStatus(
+            True, True, True, True, failure_reason="GNOME login timer failed"
+        ),
+    )
+    assert code == 1
+    assert one(findings, "service").status == "fail"

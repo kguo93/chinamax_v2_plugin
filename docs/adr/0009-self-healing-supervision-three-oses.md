@@ -164,3 +164,22 @@ evidence), Codex-first because Codex exposes Claude-compatible env aliases — t
 plugin's proven ordering. Being warn-only, the hook stays fail-open: when nothing resolves it
 exits silently instead of assuming claude. Both Hosts' warn conditions themselves are
 unchanged.
+
+
+**Amended 2026-09-22 (GNOME login-scoped Linux startup).** The original Linux policy
+"Restart=always, WantedBy=default.target" and the amendment "Reboot survival on Linux
+is real, via linger" are **reversed**. Linux now enables only a GNOME-session timer,
+which starts the Proxy 60 seconds after session activation. Both timer and service
+stop with GNOME logout; a later login gets a new countdown even with linger enabled.
+Crash recovery retains Restart=always and RestartSec=3 without a new login delay.
+Requisite and After on gnome-session.target prevent the Proxy from pulling GNOME in;
+PartOf propagates logout. The timer disables default dependencies to avoid ordering
+itself before timers.target while also running after GNOME, and explicitly retains
+shutdown ordering. No boot/SSH/TTY/unlock startup is supported. macOS/Windows are unchanged.
+
+Setup manages both unit artifacts, removes legacy service enablement without stopping
+an active Proxy, and never enables or disables account-wide linger. Repeated setup
+preserves an active countdown. Doctor reports a correctly installed/enabled login wait
+or countdown as informational, but missing units, failed units, and failed startup
+remain failures. Live setup probes are deferred while waiting. Teardown removes both
+units. Cross-reference ADR 0005's amendment of the same date.

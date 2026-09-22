@@ -67,7 +67,7 @@ class ScriptedRunner:
         argv = list(argv)
         self.calls.append(argv)
         for token, resp in self.responses.items():
-            if token in argv:
+            if (tuple(argv[2:]) == token if isinstance(token, tuple) else token in argv):
                 return resp
         return (0, "", "")
 
@@ -128,13 +128,25 @@ def test_unit_content_per_os(tmp_path, winsw_exe):
     log_dir = tmp_path / "logs"
     cfg = _config(tmp_path, log_dir=log_dir, winsw_exe_path=winsw_exe)
 
-    # systemd user unit: Restart=always, WantedBy=default.target, exact quoted ExecStart.
+    # Session-bound service and one-shot login timer; crash restarts have no sleep.
     systemd = render(cfg, platform="linux")
     assert isinstance(systemd, RenderedArtifact)
     unit = systemd.content.decode("utf-8")
     assert "Restart=always" in unit
     assert "RestartSec=3" in unit
-    assert "WantedBy=default.target" in unit
+    assert "WantedBy=" not in unit
+    assert "Requisite=gnome-session.target" in unit
+    assert "PartOf=gnome-session.target" in unit
+    assert "ExecStartPre" not in unit
+    timer = systemd.companions[0]
+    assert timer.path.name == "chinamaxM.timer"
+    text = timer.content.decode()
+    for setting in ("OnActiveSec=60s", "AccuracySec=1s", "DefaultDependencies=no",
+                    "WantedBy=gnome-session.target", "PartOf=gnome-session.target",
+                    "Requisite=gnome-session.target", "RemainAfterElapse=yes"):
+        assert setting in text
+    assert "default.target" not in text
+    assert "OnBootSec" not in text and "OnStartupSec" not in text
     assert f'ExecStart="{sys.executable}" "-m" "chinamaxM.proxy"' in unit
     assert str(log_dir) not in unit  # Linux logs to journald, never a file path
 
@@ -232,55 +244,74 @@ def test_no_secrets_or_foreign_paths(tmp_path, winsw_exe, monkeypatch):
 
 
 def test_ops_idempotent_and_mocked(tmp_path, monkeypatch):
-    """AC-3 (systemd): converge install/update/teardown are idempotent; negatives ≠ raise."""
+    """Converge both units without starting the service or resetting its timer."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     cfg = _config(tmp_path)
-    unit = tmp_path / "xdg" / "systemd" / "user" / "chinamaxM.service"
-
-    # fresh install: disabled + inactive ⇒ reload, enable, start.
-    r1 = ScriptedRunner({"is-enabled": (1, "disabled"), "is-active": (4, "inactive")})
-    install(cfg, platform="linux", runner=r1)
-    assert unit.exists()
-    assert [_verb(c) for c in r1.calls] == [
-        "is-enabled", "is-active", "daemon-reload", "enable", "start",
+    artifact = render(cfg, platform="linux")
+    unit, timer = artifact.path, artifact.companions[0].path
+    responses = {
+        ("is-enabled", "chinamaxM.service"): (1, "static"),
+        ("is-enabled", "chinamaxM.timer"): (1, "disabled"),
+        ("is-active", "gnome-session.target"): (0, "active"),
+        ("is-active", "chinamaxM.timer"): (3, "inactive"),
+    }
+    runner = ScriptedRunner(responses)
+    install(cfg, platform="linux", runner=runner)
+    assert unit.read_bytes() == artifact.content
+    assert timer.read_bytes() == artifact.companions[0].content
+    assert runner.calls == [
+        ["systemctl", "--user", "is-enabled", "chinamaxM.service"],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "is-enabled", "chinamaxM.timer"],
+        ["systemctl", "--user", "enable", "chinamaxM.timer"],
+        ["systemctl", "--user", "is-active", "gnome-session.target"],
+        ["systemctl", "--user", "is-active", "chinamaxM.timer"],
+        ["systemctl", "--user", "start", "chinamaxM.timer"],
     ]
+    link = timer.parent / "gnome-session.target.wants" / timer.name
+    link.parent.mkdir()
+    link.symlink_to(timer)
+    responses[("is-enabled", "chinamaxM.timer")] = (0, "enabled")
+    responses[("is-active", "chinamaxM.timer")] = (0, "active")
+    runner = ScriptedRunner(responses)
+    install(cfg, platform="linux", runner=runner)
+    assert all(_verb(c).startswith("is-") for c in runner.calls)
 
-    # re-install over a fully converged service ⇒ no state-changing calls (queries only).
-    r2 = ScriptedRunner({"is-enabled": (0, "enabled"), "is-active": (0, "active")})
-    install(cfg, platform="linux", runner=r2)
-    assert [_verb(c) for c in r2.calls] == ["is-enabled", "is-active"]
+    # A timer-only drift is repaired without resetting the countdown or Proxy.
+    timer.write_text("drift")
+    runner = ScriptedRunner(responses)
+    update(cfg, platform="linux", runner=runner)
+    assert timer.read_bytes() == artifact.companions[0].content
+    assert [_verb(c) for c in runner.calls].count("daemon-reload") == 1
+    assert not any(_verb(c) in ("start", "stop", "restart") for c in runner.calls)
 
-    # partial (artifact byte-identical but disabled + inactive) ⇒ converges again.
-    r3 = ScriptedRunner({"is-enabled": (1, "disabled"), "is-active": (4, "inactive")})
-    install(cfg, platform="linux", runner=r3)
-    assert [_verb(c) for c in r3.calls] == [
-        "is-enabled", "is-active", "daemon-reload", "enable", "start",
+    # Legacy boot enablement is disabled without --now, even on a running installation.
+    responses[("is-enabled", "chinamaxM.service")] = (0, "enabled")
+    runner = ScriptedRunner(responses)
+    update(cfg, platform="linux", runner=runner)
+    assert runner.calls[1] == ["systemctl", "--user", "disable", "chinamaxM.service"]
+    assert not any(_verb(c) in ("start", "stop", "restart") for c in runner.calls)
+
+    # No GNOME session: install enables future startup without starting anything.
+    responses[("is-enabled", "chinamaxM.service")] = (1, "static")
+    responses[("is-active", "gnome-session.target")] = (3, "inactive")
+    runner = ScriptedRunner(responses)
+    install(cfg, platform="linux", runner=runner)
+    assert not any(_verb(c) == "start" for c in runner.calls)
+
+    runner = ScriptedRunner()
+    teardown(cfg, platform="linux", runner=runner)
+    assert not unit.exists() and not timer.exists()
+    assert runner.calls == [
+        ["systemctl", "--user", "stop", "chinamaxM.timer"],
+        ["systemctl", "--user", "disable", "chinamaxM.timer"],
+        ["systemctl", "--user", "stop", "chinamaxM.service"],
+        ["systemctl", "--user", "disable", "chinamaxM.service"],
+        ["systemctl", "--user", "daemon-reload"],
     ]
-
-    # update: rewrite + daemon-reload + (already enabled) + restart.
-    r4 = ScriptedRunner({"is-enabled": (0, "enabled")})
-    update(cfg, platform="linux", runner=r4)
-    assert [_verb(c) for c in r4.calls] == ["daemon-reload", "is-enabled", "restart"]
-
-    # update-when-absent converges like install (not enabled ⇒ enable).
-    r5 = ScriptedRunner({"is-enabled": (1, "disabled")})
-    update(cfg, platform="linux", runner=r5)
-    assert [_verb(c) for c in r5.calls] == [
-        "daemon-reload", "is-enabled", "enable", "restart",
-    ]
-
-    # teardown: active + enabled ⇒ stop, disable, remove artifact, daemon-reload.
-    r6 = ScriptedRunner({"is-enabled": (0, "enabled"), "is-active": (0, "active")})
-    teardown(cfg, platform="linux", runner=r6)
-    assert not unit.exists()
-    assert [_verb(c) for c in r6.calls] == [
-        "is-active", "is-enabled", "stop", "disable", "daemon-reload",
-    ]
-
-    # double teardown / teardown-when-absent ⇒ queries only, no error (exit 4 negatives).
-    r7 = ScriptedRunner({"is-enabled": (4, "not-found"), "is-active": (4, "inactive")})
-    teardown(cfg, platform="linux", runner=r7)
-    assert [_verb(c) for c in r7.calls] == ["is-active", "is-enabled"]
+    absent = ScriptedRunner({"stop": (5, "", "Unit not loaded"),
+                             "disable": (1, "", "Unit does not exist")})
+    teardown(cfg, platform="linux", runner=absent)
 
 
 def test_launchd_ops_command_sequences(tmp_path):
@@ -493,7 +524,12 @@ def test_status_primitives_distinct(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     unit = tmp_path / "xdg" / "systemd" / "user" / "chinamaxM.service"
     unit.parent.mkdir(parents=True)
-    unit.write_bytes(b"[Unit]\n")  # artifact present ⇒ installed True
+    unit.write_bytes(b"[Unit]\n")
+    timer = unit.with_suffix(".timer")
+    timer.write_bytes(b"[Timer]\n")
+    link = unit.parent / "gnome-session.target.wants" / timer.name
+    link.parent.mkdir()
+    link.symlink_to(timer)
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -617,3 +653,55 @@ def test_linger_helpers():
     failing = ScriptedRunner({"enable-linger": (1, "", "boom")})
     with pytest.raises(SupervisionError):
         enable_linger(runner=failing, platform="linux")
+
+
+@pytest.mark.parametrize(
+    "session,timer_state,service_state,expected",
+    [
+        (False, "inactive", "inactive", "waiting for GNOME login"),
+        (True, "waiting", "inactive", "waiting for the 60-second GNOME login timer"),
+        (True, "elapsed", "inactive", ""),
+        (True, "failed", "inactive", ""),
+        (False, "inactive", "failed", ""),
+    ],
+)
+def test_session_waiting_states(tmp_path, monkeypatch, session, timer_state, service_state, expected):
+    """Only a healthy installation may report a pending session or countdown."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg = _config(tmp_path)
+    artifact = render(cfg, platform="linux")
+    for item in artifact.artifacts:
+        item.path.parent.mkdir(parents=True, exist_ok=True)
+        item.path.write_bytes(item.content)
+    timer = artifact.companions[0].path
+    link = timer.parent / "gnome-session.target.wants" / timer.name
+    link.parent.mkdir()
+    link.symlink_to(timer)
+    runner = ScriptedRunner({
+        ("is-active", "gnome-session.target"): (0 if session else 3, "active" if session else "inactive"),
+        "is-active": (3, service_state),
+        "is-enabled": (0, "enabled"),
+        ("show", "chinamaxM.timer", "--property=ActiveState,SubState,ActiveEnterTimestampMonotonic"):
+            (0, f"ActiveState={'failed' if timer_state == 'failed' else 'active'}\nSubState={timer_state}"),
+        "show": (0, f"ActiveState={service_state}"),
+    })
+    assert status(cfg, platform="linux", runner=runner).waiting_reason == expected
+    # A legacy boot-start link invalidates even an otherwise healthy timer.
+    legacy = timer.parent / "default.target.wants" / artifact.path.name
+    legacy.parent.mkdir()
+    legacy.symlink_to(artifact.path)
+    broken = status(cfg, platform="linux", runner=runner)
+    assert not broken.enabled and not broken.waiting_reason
+    # Missing companion cannot be excused by an inactive graphical session.
+    timer.rename(timer.with_suffix(".saved"))
+    broken = status(cfg, platform="linux", runner=runner)
+    assert not broken.installed and not broken.waiting_reason
+
+
+def test_timer_mutation_failure_propagates(tmp_path, monkeypatch):
+    """A timer enable failure cannot be reported as a successful install."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    runner = ScriptedRunner({"is-enabled": (1, "disabled"), "enable": (1, "", "Permission denied")})
+    with pytest.raises(SupervisionError, match="Permission denied"):
+        install(_config(tmp_path), platform="linux", runner=runner)
+    assert not any(_verb(c) == "start" for c in runner.calls)

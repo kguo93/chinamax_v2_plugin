@@ -18,7 +18,7 @@ import pytest
 
 from chinamaxM import doctor, settings_json
 from chinamaxM.keyfiles import HostResolutionError, resolve_host
-from chinamaxM.ops.supervision import SupervisionStatus
+from chinamaxM.ops.supervision import RenderedArtifact, SupervisionStatus
 from chinamaxM.setup import (
     _GIT_FOR_WINDOWS_URL,
     ProbeResponse,
@@ -72,12 +72,6 @@ class FakeConda:
         self.pip_calls.append(str(plugin_root))
 
 
-class FakeArtifact:
-    def __init__(self, path, content):
-        self.path = path
-        self.content = content
-
-
 class FakeService:
     """A spying service seam that records install/update/teardown calls."""
 
@@ -90,7 +84,7 @@ class FakeService:
         self.teardowns = 0
 
     def render(self, cfg):
-        return FakeArtifact(self.unit_path, self.content)
+        return RenderedArtifact(self.unit_path, self.content)
 
     def install(self, cfg):
         self.installs += 1
@@ -182,8 +176,6 @@ def make_engine(tmp_path, **overrides):
     service = overrides.pop("service", None) or FakeService(tmp_path / "chinamaxM.service")
     http = overrides.pop("http", None) or FakeHttp()
     diagnose = overrides.pop("diagnose", None) or (lambda: _healthy_findings())
-    linger_on = overrides.pop("linger_on", False)
-    linger_calls: list[int] = []
     port_live = overrides.pop("port_live", None) or (lambda port: True)
     platform = overrides.pop("platform", "linux")
 
@@ -215,8 +207,6 @@ def make_engine(tmp_path, **overrides):
         service_teardown=service.teardown,
         service_render=service.render,
         port_live=port_live,
-        enable_linger=lambda: linger_calls.append(1),
-        linger_enabled=lambda: linger_on,
         http=http,
         sleep=lambda _seconds: None,
         now=_clock(),
@@ -224,7 +214,7 @@ def make_engine(tmp_path, **overrides):
         **overrides,
     )
     ctx = {"claude": claude, "codex": codex, "conda": conda, "service": service,
-           "http": http, "linger_calls": linger_calls}
+           "http": http}
     return engine, ctx
 
 
@@ -299,9 +289,9 @@ def test_apply_steps_against_temp_roots(tmp_path):
         assert not (tmp_path / "codex" / "agents" / f"{name}.toml").exists()
     assert not (tmp_path / "codex" / "config.toml").exists()
 
-    # Service install() called once; enable-linger recorded on Linux.
+    # Service install() called once; setup never enables Linux linger.
     assert ctx["service"].installs == 1 and ctx["service"].updates == 0
-    assert ctx["linger_calls"] == [1]
+    assert all(step.id != "linger" for step in plan.steps)
     assert report.restart_instruction and "Restart" in render_report(report)
 
 
@@ -312,14 +302,14 @@ def test_apply_skips_when_env_exists_and_updates_service(tmp_path):
     unit.write_bytes(b"stale-different-bytes")  # on disk differs from the rendered content
     conda = FakeConda(exists=True, python="3.12")
     service = FakeService(unit, content=b"unit-content")
-    engine, ctx = make_engine(tmp_path, conda=conda, service=service, linger_on=True)
+    engine, ctx = make_engine(tmp_path, conda=conda, service=service)
 
     plan = engine.build_plan()
     report = engine.apply(plan.digest)
     assert report.exit_code == 0, render_report(report)
     assert ctx["conda"].created == 0  # existing 3.12 env → create skipped
     assert ctx["service"].updates == 1 and ctx["service"].installs == 0  # changed unit → update
-    assert ctx["linger_calls"] == []  # linger already on → skipped
+    assert all(step.id != "linger" for step in plan.steps)
 
 
 def test_probe_optin_separate(tmp_path):
@@ -662,6 +652,7 @@ class _Art:
     def __init__(self, path):
         self.path = path
         self.content = b"unit"
+        self.artifacts = (self,)
 
 
 claude = tempfile.mkdtemp()
@@ -673,7 +664,7 @@ engine = setup.SetupEngine(
     service_install=lambda cfg: None, service_update=lambda cfg: None,
     service_teardown=lambda cfg: None,
     service_render=lambda cfg: _Art(claude + "/unit.service"),
-    port_live=lambda p: True, enable_linger=lambda: None, linger_enabled=lambda: False,
+    port_live=lambda p: True,
     http=lambda *a, **k: None, sleep=lambda s: None, now=lambda: 0.0, platform="linux",
 )
 plan = engine.build_plan()          # the --plan-only diagnose+plan path
@@ -1499,3 +1490,39 @@ def test_docs_never_hardcode_an_interpreter():
         assert "python3 -m" not in text, f"{path} still hardcodes `python3 -m`"
         assert "conda run -n chinamaxM python" not in text, f"{path} still hardcodes a conda-run launcher"
         assert "`python -m chinamaxM" not in text, f"{path} still has a backticked `python -m chinamaxM`"
+
+
+@pytest.mark.parametrize("reason", ["waiting for GNOME login", "waiting for the 60-second GNOME login timer"])
+def test_setup_defers_readiness_and_probes_during_login_wait(tmp_path, reason):
+    """A valid login wait completes setup without early startup or paid probes."""
+    service = FakeService(tmp_path / "chinamaxM.service", status=SupervisionStatus(True, True, False, False, reason))
+    engine, ctx = make_engine(tmp_path, service=service, port_live=lambda port: False)
+    plan = engine.build_plan()
+    assert all(step.id != "linger" for step in plan.steps)
+    report = engine.apply(plan.digest, probes=True)
+    assert report.exit_code == 0
+    assert next(r for r in report.step_results if r.id == "readiness").detail == reason
+    assert report.probes_skipped == f"deferred — {reason}"
+    assert ctx["http"].requests == []
+
+
+def test_timer_artifact_drift_and_plan_digest(tmp_path):
+    """Setup binds both artifacts and repairs a drifted timer even with a current service."""
+    service = FakeService(tmp_path / "chinamaxM.service")
+    timer = RenderedArtifact(tmp_path / "chinamaxM.timer", b"timer-v1")
+    service.render = lambda cfg: RenderedArtifact(service.unit_path, service.content, (timer,))
+    service.unit_path.write_bytes(service.content)
+    timer.path.write_bytes(b"stale-timer")
+    engine, ctx = make_engine(tmp_path, service=service)
+    plan = engine.build_plan()
+    step = next(s for s in plan.steps if s.id == "service")
+    assert step.targets == [str(service.unit_path), str(timer.path)]
+    assert step.descriptor["startup"] == {"target": "gnome-session.target", "delay_seconds": 60}
+    timer = RenderedArtifact(timer.path, b"timer-v2")
+    assert engine.build_plan().digest != plan.digest
+    assert engine.apply(plan.digest).rejected
+    report = engine.apply(engine.build_plan().digest)
+    assert report.exit_code == 0
+    assert service.updates == 1 and service.installs == 0
+    teardown = next(s for s in engine.build_teardown_plan().steps if s.id == "service-teardown")
+    assert teardown.targets == step.targets

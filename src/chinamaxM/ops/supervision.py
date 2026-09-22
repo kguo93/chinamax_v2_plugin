@@ -35,6 +35,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import urllib.request
 import plistlib
 import xml.etree.ElementTree as ET
@@ -72,6 +73,8 @@ _RUNNER_TIMEOUT = 30.0
 
 #: Pinned identifiers (unit/plist/service names are plan-level, not ADR — see ADR 0009).
 _UNIT_NAME = "chinamaxM.service"
+_TIMER_NAME = "chinamaxM.timer"
+_SESSION_TARGET = "gnome-session.target"
 _DESCRIPTION = "chinamaxM local reverse proxy"
 _LAUNCHD_LABEL = "com.chinamaxM.proxy"
 _WINSW_SERVICE_ID = "chinamaxM"
@@ -175,6 +178,8 @@ class SupervisionStatus:
     enabled: bool
     running: bool
     port_live: bool
+    waiting_reason: str = ""
+    failure_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -183,6 +188,12 @@ class RenderedArtifact:
 
     path: Path
     content: bytes
+    companions: tuple[RenderedArtifact, ...] = ()
+
+    @property
+    def artifacts(self) -> tuple[RenderedArtifact, ...]:
+        """Return the primary artifact followed by any companion units."""
+        return (self, *self.companions)
 
 
 def default_log_dir() -> Path:
@@ -454,24 +465,48 @@ class _SystemdManager(_Manager):
         return Path(base) / "systemd" / "user" / _UNIT_NAME
 
     def render(self) -> bytes:
-        """Render the systemd unit (Restart=always, WantedBy=default.target, journald)."""
+        """Render the GNOME-session-scoped service with fast crash recovery."""
         argv = [self._cfg.python_path, *self._cfg.entry]
         exec_start = " ".join(_systemd_quote(token) for token in argv)
         text = (
             "[Unit]\n"
             f"Description={_DESCRIPTION}\n"
+            f"Requisite={_SESSION_TARGET}\n"
+            f"After={_SESSION_TARGET}\n"
+            f"PartOf={_SESSION_TARGET}\n"
             "\n"
             "[Service]\n"
             f"ExecStart={exec_start}\n"
             "Restart=always\n"
             "RestartSec=3\n"
-            "\n"
-            "[Install]\n"
-            "WantedBy=default.target\n"
         )
         return text.encode("utf-8")
 
-    # -- status primitives -------------------------------------------------------------
+    @property
+    def timer_path(self) -> Path:
+        """Return the companion login timer path."""
+        return self.artifact_path.with_name(_TIMER_NAME)
+
+    def render_timer(self) -> bytes:
+        """Render a one-shot timer reset by each GNOME session."""
+        return (
+            "[Unit]\n"
+            "Description=Start chinamaxM 60 seconds after GNOME login\n"
+            "DefaultDependencies=no\n"
+            f"Requisite={_SESSION_TARGET}\n"
+            f"After={_SESSION_TARGET}\n"
+            f"PartOf={_SESSION_TARGET}\n"
+            "Conflicts=shutdown.target\n"
+            "Before=shutdown.target\n\n"
+            "[Timer]\n"
+            "OnActiveSec=60s\n"
+            "AccuracySec=1s\n"
+            "RandomizedDelaySec=0\n"
+            "RemainAfterElapse=yes\n"
+            f"Unit={_UNIT_NAME}\n\n"
+            "[Install]\n"
+            f"WantedBy={_SESSION_TARGET}\n"
+        ).encode("utf-8")
 
     def _systemctl(self, *args: str) -> list[str]:
         return ["systemctl", "--user", *args]
@@ -480,21 +515,19 @@ class _SystemdManager(_Manager):
         if any(marker in err for marker in _RAISE_MARKERS):
             raise SupervisionError(list(argv), code, err)
 
-    def _is_enabled(self) -> bool:
-        argv = self._systemctl("is-enabled", _UNIT_NAME)
+    def _is_enabled(self, unit: str = _TIMER_NAME) -> bool:
+        argv = self._systemctl("is-enabled", unit)
         code, out, err = self._invoke(argv)
         self._guard(argv, code, err)
         token = out.strip()
         if token in _ENABLED_TRUE:
             return True
-        if token in _ENABLED_FALSE:
-            return False
-        if token == "" and code != 0:
+        if token in _ENABLED_FALSE or (not token and code != 0):
             return False
         raise SupervisionError(argv, code, err or out)
 
-    def _is_active(self) -> bool:
-        argv = self._systemctl("is-active", _UNIT_NAME)
+    def _is_active(self, unit: str = _UNIT_NAME) -> bool:
+        argv = self._systemctl("is-active", unit)
         code, out, err = self._invoke(argv)
         self._guard(argv, code, err)
         token = out.strip()
@@ -504,47 +537,74 @@ class _SystemdManager(_Manager):
             return False
         raise SupervisionError(argv, code, err or out)
 
-    def status(self) -> SupervisionStatus:
-        return SupervisionStatus(
-            installed=self.artifact_path.exists(),
-            enabled=self._is_enabled(),
-            running=self._is_active(),
-            port_live=port_live(self._cfg.port),
+    def _properties(self, unit: str) -> dict[str, str]:
+        """Read lifecycle properties without conflating failures and waiting."""
+        argv = self._systemctl(
+            "show", unit, "--property=ActiveState,SubState,ActiveEnterTimestampMonotonic"
         )
+        code, out, err = self._invoke(argv)
+        if code:
+            raise SupervisionError(argv, code, err)
+        return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
-    # -- converge operations -----------------------------------------------------------
+    def _login_link(self) -> Path:
+        return self.timer_path.parent / f"{_SESSION_TARGET}.wants" / _TIMER_NAME
+
+    def _legacy_link(self) -> Path:
+        return self.artifact_path.parent / "default.target.wants" / _UNIT_NAME
+
+    def status(self) -> SupervisionStatus:
+        installed = self.artifact_path.is_file() and self.timer_path.is_file()
+        enabled = self._is_enabled() and self._login_link().exists()
+        enabled = enabled and not self._legacy_link().is_symlink()
+        running = self._is_active()
+        live = port_live(self._cfg.port)
+        waiting = ""
+        failure = ""
+        if installed and enabled:
+            service = self._properties(_UNIT_NAME)
+            timer = self._properties(_TIMER_NAME)
+            failed = "failed" in (service.get("ActiveState"), timer.get("ActiveState"))
+            if failed:
+                failure = "Proxy service or GNOME login timer failed"
+            else:
+                if not running and not self._is_active(_SESSION_TARGET):
+                    waiting = "waiting for GNOME login"
+                elif not running and timer.get("SubState") == "waiting":
+                    waiting = "waiting for the 60-second GNOME login timer"
+                elif running and not live:
+                    started = int(service.get("ActiveEnterTimestampMonotonic", "0")) / 1e6
+                    if started and 0 <= time.monotonic() - started < 30:
+                        waiting = "Proxy starting; waiting for its listening port"
+        return SupervisionStatus(installed, enabled, running, live, waiting, failure)
 
     def install(self) -> None:
-        """Write the unit and converge manager state to enabled + running."""
-        wrote = self._write_if_changed(self.artifact_path, self.render())
-        enabled = self._is_enabled()
-        active = self._is_active()
-        if wrote or not enabled or not active:
+        """Converge session startup without interrupting a running Proxy."""
+        # Disable before replacing the legacy unit's [Install] section; never --now.
+        legacy = self._is_enabled(_UNIT_NAME) or self._legacy_link().is_symlink()
+        if legacy:
+            self._run_checked(self._systemctl("disable", _UNIT_NAME))
+        wrote_service = self._write_if_changed(self.artifact_path, self.render())
+        wrote_timer = self._write_if_changed(self.timer_path, self.render_timer())
+        if wrote_service or wrote_timer or legacy:
             self._run_checked(self._systemctl("daemon-reload"))
-        if not enabled:
-            self._run_checked(self._systemctl("enable", _UNIT_NAME))
-        if not active:
-            self._run_checked(self._systemctl("start", _UNIT_NAME))
+        if not self._is_enabled() or not self._login_link().exists():
+            self._run_checked(self._systemctl("enable", _TIMER_NAME))
+        if self._is_active(_SESSION_TARGET) and not self._is_active(_TIMER_NAME):
+            self._run_checked(self._systemctl("start", _TIMER_NAME))
 
     def update(self) -> None:
-        """Apply-and-restart: rewrite the unit, daemon-reload, ensure enabled, restart."""
-        self._write_if_changed(self.artifact_path, self.render())
-        self._run_checked(self._systemctl("daemon-reload"))
-        if not self._is_enabled():
-            self._run_checked(self._systemctl("enable", _UNIT_NAME))
-        self._run_checked(self._systemctl("restart", _UNIT_NAME))
+        """Repair both artifacts while preserving active service and timer processes."""
+        self.install()
 
     def teardown(self) -> None:
-        """Converge to absent: stop, disable, remove the unit, daemon-reload."""
-        active = self._is_active()
-        enabled = self._is_enabled()
-        if active:
-            self._run_tolerant(self._systemctl("stop", _UNIT_NAME))
-        if enabled:
-            self._run_tolerant(self._systemctl("disable", _UNIT_NAME))
-        removed = self._remove(self.artifact_path)
-        if active or enabled or removed:
-            self._run_checked(self._systemctl("daemon-reload"))
+        """Stop the timer first, then remove both units and legacy enablement."""
+        for unit in (_TIMER_NAME, _UNIT_NAME):
+            self._run_tolerant(self._systemctl("stop", unit))
+            self._run_tolerant(self._systemctl("disable", unit))
+        self._remove(self.timer_path)
+        self._remove(self.artifact_path)
+        self._run_checked(self._systemctl("daemon-reload"))
 
 
 def _systemd_quote(arg: str) -> str:
@@ -892,7 +952,7 @@ def install(
 def update(
     cfg: SupervisionConfig, *, platform: str | None = None, runner: Runner | None = None
 ) -> None:
-    """Apply-and-restart: rewrite the artifact and restart per OS (converges when absent)."""
+    """Update artifacts; Linux preserves active processes, other OSes restart."""
     _make_manager(cfg, platform, runner).update()
 
 
@@ -913,4 +973,7 @@ def status(
 def render(cfg: SupervisionConfig, *, platform: str | None = None) -> RenderedArtifact:
     """Render the unit artifact (install path + bytes) without touching the manager."""
     manager = _make_manager(cfg, platform, None)
-    return RenderedArtifact(manager.artifact_path, manager.render())
+    companions = ()
+    if isinstance(manager, _SystemdManager):
+        companions = (RenderedArtifact(manager.timer_path, manager.render_timer()),)
+    return RenderedArtifact(manager.artifact_path, manager.render(), companions)

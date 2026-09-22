@@ -508,8 +508,6 @@ class SetupEngine:
         service_teardown: Callable[[object], None] | None = None,
         service_render: Callable[[object], object] | None = None,
         port_live: Callable[[int], bool] | None = None,
-        enable_linger: Callable[[], None] | None = None,
-        linger_enabled: Callable[[], bool] | None = None,
         http: Callable[..., ProbeResponse] | None = None,
         sleep: Callable[[float], None] | None = None,
         now: Callable[[], float] | None = None,
@@ -548,8 +546,6 @@ class SetupEngine:
         self._conda = conda or _SubprocessConda(self._run, home=self._home, platform=self._platform)
         self._generate_fn = generate_fn or self._subprocess_generate
         self._port_live = port_live or supervision.port_live
-        self._enable_linger = enable_linger or (lambda: supervision.enable_linger(platform=self._platform))
-        self._linger_enabled = linger_enabled or (lambda: supervision.linger_enabled(platform=self._platform))
         self._service_status = service_status or (lambda cfg: supervision.status(cfg, platform=self._platform))
         self._service_install = service_install or (lambda cfg: supervision.install(cfg, platform=self._platform))
         self._service_update = service_update or (lambda cfg: supervision.update(cfg, platform=self._platform))
@@ -964,7 +960,6 @@ class SetupEngine:
     def _read_preconditions(self) -> dict:
         """Read the drift-relevant machine state ONCE through the runner (diagnostic ops)."""
         r = self._runner
-        is_linux = self._platform.startswith("linux")
         return {
             "conda_available": r.run("diagnostic", "pc:conda-available", self._conda.available),
             "conda_env_exists": r.run("diagnostic", "pc:conda-env-exists", self._conda.env_exists),
@@ -972,7 +967,6 @@ class SetupEngine:
             "codex_wired": r.run("diagnostic", "pc:codex-wired", self._codex_wired),
             "settings_flip": r.run("diagnostic", "pc:settings-flip", self._read_settings_flip_state),
             "service": r.run("diagnostic", "pc:service", self._service_state),
-            "linger_enabled": r.run("diagnostic", "pc:linger", self._linger_enabled) if is_linux else False,
             "registry_port": self._registry.port,
             "registry_digest": r.run("diagnostic", "pc:registry-digest", self._registry_digest),
         }
@@ -1121,10 +1115,11 @@ class SetupEngine:
                 run=lambda e: e._apply_codex_validate(),
             ))
 
-        # (d) service unit + install/update, then Linux linger.
+        # (d) service artifacts and platform startup policy.
         service_title = "Write the Proxy service unit and install (or update) it"
         service_descriptor = {
             "op": "service", "entry": list(PROXY_ENTRY),
+            "python_path": str(self._conda.env_python_path()),
             "port": self._registry.port, "log_dir": str(self._log_dir),
         }
         if self._platform.startswith("win"):
@@ -1133,22 +1128,22 @@ class SetupEngine:
             winsw = self._winsw_source()
             service_descriptor["winsw"] = winsw
             service_title += f" — WinSW source: {winsw['render']}"
+        rendered = self._service_render(self._status_cfg())
+        artifacts = rendered.artifacts
+        service_descriptor["artifacts"] = [
+            {"path": str(a.path), "template_sha256": hashlib.sha256(a.content).hexdigest()}
+            for a in artifacts
+        ]
+        if self._platform.startswith("linux"):
+            service_title = "Install GNOME login timer (60s); preserve the running Proxy"
+            service_descriptor["startup"] = {"target": "gnome-session.target", "delay_seconds": 60}
         steps.append(PlanStep(
             id="service", kind="mutating", action="INSTALL/UPDATE",
             title=service_title,
-            targets=[str(self._service_artifact_path())],
+            targets=[str(a.path) for a in artifacts],
             descriptor=service_descriptor,
             run=lambda e: e._apply_service(),
         ))
-        if self._platform.startswith("linux"):
-            already = pc["linger_enabled"]
-            steps.append(PlanStep(
-                id="linger", kind="mutating", action="SKIP" if already else "ENABLE-LINGER",
-                title="Enable systemd linger (headless reboot survival)", targets=[],
-                descriptor={"op": "enable-linger", "already": already},
-                run=None if already else (lambda e: e._apply_linger()),
-            ))
-
         # (e) readiness poll (diagnostic — a timeout is "may still be starting", never down).
         steps.append(PlanStep(
             id="readiness", kind="diagnostic", action="POLL",
@@ -1327,19 +1322,23 @@ class SetupEngine:
                 )
         cfg = self._install_cfg(winsw_exe_path)
         rendered = self._service_render(cfg)
-        path = Path(rendered.path)
-        on_disk = path.read_bytes() if path.exists() else None
-        if on_disk is not None and on_disk != rendered.content:
+        changed = any(
+            a.path.exists() and a.path.read_bytes() != a.content
+            for a in rendered.artifacts
+        )
+        if changed:
             self._service_update(cfg)
-            return "service updated (unit artifact changed)" + caveat
-        self._service_install(cfg)
-        return "service installed, enabled, and started" + caveat
-
-    def _apply_linger(self) -> str:
-        self._enable_linger()
-        return "systemd linger enabled"
+        else:
+            self._service_install(cfg)
+        if self._platform.startswith("linux"):
+            return "GNOME login timer installed; running Proxy preserved; linger unchanged"
+        return ("service updated (unit artifact changed)" if changed
+                else "service installed, enabled, and started") + caveat
 
     def _apply_readiness(self) -> str:
+        waiting = self._service_status(self._status_cfg()).waiting_reason
+        if waiting and not self._port_live(self._registry.port):
+            return waiting
         deadline = self._now() + _READINESS_DEADLINE
         delay = _READINESS_INITIAL_DELAY
         while True:
@@ -1367,6 +1366,9 @@ class SetupEngine:
                 and getattr(finding, "status", None) in ("fail", "error")
             ):
                 return [], f"skipped — re-diagnose reported a FAIL-level {finding.id} finding"
+        waiting = self._service_status(self._status_cfg()).waiting_reason
+        if waiting and not self._port_live(self._registry.port):
+            return [], f"deferred — {waiting}"
         return self._run_probes(), None
 
     def _run_probes(self) -> list[ProbeResult]:
@@ -1423,7 +1425,7 @@ class SetupEngine:
         steps.append(PlanStep(
             id="service-teardown", kind="mutating", action="UNINSTALL",
             title="Uninstall the Proxy supervision service",
-            targets=[str(self._service_artifact_path())],
+            targets=[str(a.path) for a in self._service_render(self._status_cfg()).artifacts],
             descriptor={"op": "service-teardown", "port": self._registry.port},
             run=lambda e: e._apply_service_teardown(),
         ))

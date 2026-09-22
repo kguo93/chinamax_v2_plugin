@@ -84,7 +84,7 @@ agents are picked up.
 ## Teardown
 
 Host-scoped: removes the Claude env flip, the shared Proxy service, and the recorded
-interpreter; keys, agents, and Linux linger are left in place. The Proxy service is SHARED —
+interpreter; keys, agents, and existing account-wide Linux linger are left in place. The Proxy service is SHARED —
 if Codex was also wired, tearing down here removes its Proxy too, and the report says so
 (run teardown inside Codex to unwire its provider entries).
 
@@ -112,3 +112,8 @@ if Codex was also wired, tearing down here removes its Proxy too, and the report
   `--winsw-service-password-file <path>` to supply the service-account password (read from the
   file, never logged). NOTE: the Windows path is NOT live-verified on a real Windows host in this
   build (mocked-tested only).
+
+On Linux, setup installs a GNOME-session timer: start the Proxy after 60 seconds, stop
+it on logout, and recover crashes after 3 seconds. Existing running Proxies are preserved
+during migration. Setup does not enable linger. Pending login/countdown states are
+reported as informational; requested live probes are deferred until startup completes.

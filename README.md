@@ -123,9 +123,14 @@ you never babysit it. The mechanism differs by OS:
 
 | OS | Mechanism | Survives reboot? |
 |---|---|---|
-| Linux | systemd **user** service (`Restart=always`); setup also enables `loginctl` linger | Yes, even headless |
+| Linux | systemd **user** service plus GNOME login timer; 60-second delay, stops on logout | Starts 60 seconds after the next GNOME login |
 | macOS | launchd LaunchAgent (`KeepAlive=true`) | Starts when you next log in |
 | Windows | Windows Service via WinSW, running as your user | Yes |
+
+On Linux, crash recovery takes 3 seconds and does not repeat the login delay. Boot,
+SSH/TTY login, and screen unlock do not start the proxy. Setup preserves an already
+running proxy and does not change account-wide linger. Doctor reports the login wait
+and timer countdown as informational; live probes are deferred until the proxy is ready.
 
 On Windows, setup fetches WinSW automatically (a pinned, checksum-verified official
 release) or uses one you point it at with `--winsw-exe`. The Windows path is tested but not
@@ -203,7 +208,7 @@ codex plugin add chinamaxm@chinamaxm-plugin
 
 The already-running proxy keeps serving the old code until it is restarted (Linux:
 `systemctl --user restart chinamaxM`; macOS/Windows: restart the `chinamaxM` service).
-0.3.2 fixes the intermittent `API Error: ZlibError` Claude Code raised through the proxy:
+0.3.3 fixes the intermittent `API Error: ZlibError` Claude Code raised through the proxy:
 the Default branch now asks Anthropic for uncompressed responses.
 
 ## Uninstall / teardown
@@ -211,7 +216,7 @@ the Default branch now asks Anthropic for uncompressed responses.
 Run `/chinamaxm:setup` and choose teardown. It is host-scoped: inside Claude it removes the
 `ANTHROPIC_BASE_URL` flip; inside Codex it removes the generated `chinamaxM-*` providers from
 `~/.codex/config.toml`. Either way it removes the shared proxy service and the recorded
-interpreter, and leaves your keys, generated agents, and Linux linger in place. The proxy
+interpreter, and leaves your keys, generated agents, and existing account-wide Linux linger in place. The proxy
 service is shared — if the other host is still wired to it, teardown says so (run teardown
 inside that host too). Like setup, it shows a plan and waits for your approval before touching
 anything.

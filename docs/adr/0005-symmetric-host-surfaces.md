@@ -190,3 +190,13 @@ sentences here are superseded.
   0.147 rejects hyphenated agent names); Claude keeps `chinamaxm-<profile>-<suffix>`. The
   surfaces stay symmetric in verbs and semantics; the separator charset is a Host-specific
   workaround inside the symmetric surface, exactly like the steering mediation above.
+
+
+**Amended 2026-09-22 (Linux GNOME startup — cross-ref ADR 0009).** The earlier decision
+"Setup gains a Linux linger step" is **reversed**. Setup now manages the shared service
+and GNOME login timer, preserves running Proxies during migration, and does not change
+account-wide linger. Startup waits 60 seconds after each GNOME login; logout stops the
+service and cancels its timer. Doctor treats valid waiting states as informational and
+continues to fail broken installation/startup states. Requested live probes are deferred
+while startup is pending. Teardown removes timer and service together. Host scoping and
+the other operating systems retain their prior semantics.
