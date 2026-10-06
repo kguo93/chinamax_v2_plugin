@@ -215,7 +215,7 @@ def test_role_tomls(roots):
 
     mimo = tomllib.loads((roots["codex"] / "agents" / "mimo.toml").read_text())
     assert "model_context_window" not in mimo  # Registry pins none for mimo
-    assert mimo["model"] == "mimo-v2.5"
+    assert mimo["model"] == "mimo-v2.6-flash"
 
 
 def test_worker_instructions_point_at_lazy_mcp_discovery():

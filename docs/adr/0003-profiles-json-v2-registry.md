@@ -32,7 +32,7 @@ Overlay at `~/.claude/chinamaxM/profiles.json` (same merge semantics as the old 
 | profile | anthropic endpoint | default model | key var | thinking policy |
 |---|---|---|---|---|
 | deepseek | api.deepseek.com/anthropic | deepseek-v4-pro[1m] | DEEPSEEK_API_KEY | extra_body.reasoning.effort=max |
-| mimo | api.xiaomimimo.com/anthropic | mimo-v2.5 | MIMO_API_KEY | extra_body.reasoning_effort=high |
+| mimo | api.xiaomimimo.com/anthropic | mimo-v2.6-flash | MIMO_API_KEY | extra_body.reasoning_effort=high |
 | glm | api.z.ai/api/anthropic | glm-5.3 | GLM_API_KEY | thinking:{type:enabled} |
 | minimax | api.minimax.io/anthropic | MiniMax-M3[1m] | MINIMAX_API_KEY | thinking:{type:adaptive} |
 | kimi | api.moonshot.ai/anthropic | kimi-k3 | KIMI_API_KEY | extra_body.reasoning_effort=max |
@@ -114,4 +114,14 @@ registry pinned; mutation order and extras guard recorded).**
   `glm-5.3[1m]` variant was REJECTED upstream (Z.AI error 1214 — the anthropic dialect
   relays the model string byte-for-byte after prefix strip), so the pin stays a plain
   model string with no `context_window` map. Endpoint, key var, thinking policy, and
+  scrub are unchanged.
+
+**Amended 2026-10-06 (mimo default model changed).**
+
+- The mimo Profile's shipped `default_model` was `mimo-v2.5`; it is now
+  **`mimo-v2.6-flash`** (MiMo-V2.6 series, released 2026-09-21; Xiaomi lists `mimo-v2.5`
+  as previous generation). The table above carries the new pin. Live-verified through the
+  Proxy the same day: plain `mimo/mimo-v2.6-flash` accepted (upstream echoed
+  `mimo-v2.6-flash`) with the shipped `reasoning_effort=high` policy honored. The pin is a
+  plain model string with no `context_window` map. Endpoint, key var, thinking policy, and
   scrub are unchanged.

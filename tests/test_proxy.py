@@ -394,7 +394,7 @@ _ALL_KEYS = {
 _SHAPE_CASES = [
     ("deepseek", "deepseek-v4-pro[1m]", ("reasoning", {"effort": "max"}), None),
     ("kimi", "kimi-k3", ("reasoning_effort", "max"), None),
-    ("mimo", "mimo-v2.5", ("reasoning_effort", "high"), None),
+    ("mimo", "mimo-v2.6-flash", ("reasoning_effort", "high"), None),
     ("glm", "glm-5.3", None, {"type": "enabled"}),
     ("qwen", "qwen3.8-max", None, {"type": "enabled"}),
     ("minimax", "MiniMax-M3[1m]", None, {"type": "adaptive"}),
