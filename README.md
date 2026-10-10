@@ -210,6 +210,9 @@ The already-running proxy keeps serving the old code until it is restarted (Linu
 `systemctl --user restart chinamaxM`; macOS/Windows: restart the `chinamaxM` service).
 0.3.3 fixes the intermittent `API Error: ZlibError` Claude Code raised through the proxy:
 the Default branch now asks Anthropic for uncompressed responses.
+0.3.5 fixes `API Error: 400 Invalid schema for function 'Artifact': "^[^\\0]*$" is not a
+"regex"` on deepseek: the relay now rewrites the `\0` regex escape in tool schemas to the
+equivalent `\x00`.
 
 ## Uninstall / teardown
 

@@ -125,3 +125,32 @@ registry pinned; mutation order and extras guard recorded).**
   `mimo-v2.6-flash`) with the shipped `reasoning_effort=high` policy honored. The pin is a
   plain model string with no `context_window` map. Endpoint, key var, thinking policy, and
   scrub are unchanged.
+
+**Amended 2026-10-10 (tool-schema regex-escape rewrite joins the canonical mutation
+order).**
+
+- The 2026-08-13 amendment's "**Canonical mutation order** on worker-bound requests:
+  **strip → scrub → thinking-merge → extras-merge**" is extended to **strip → scrub →
+  tool-pattern rewrite → thinking-merge → extras-merge → Dispatch marker** (the marker stage
+  per ADR 0004 as amended 2026-08-19). The new stage rewrites the octal NUL regex escape `\0`
+  to `\x00` inside every string-valued `pattern` under `tools[]` (any depth of
+  `input_schema`); a `\0` directly followed by a digit (legacy octal) and an escaped-backslash
+  pair (`\\`) are left alone, and nothing outside `tools[]` is touched.
+- Why: Claude Code 2.1.29x's built-in `Artifact` tool ships
+  `file_paths.items.pattern = "^[^\0]*$"`. DeepSeek's Anthropic endpoint validates each tool
+  `pattern` with an engine that rejects `\0` — every interactive turn 400'd with
+  `Invalid schema for function 'Artifact': "^[^\\0]*$" is not a "regex"` (live, 2026-10-10)
+  while tool-less side requests and `claude -p` (no `Artifact` tool under a non-claude.ai
+  auth source) passed. Live-verified the same day through the Proxy: `\x00` and no-pattern
+  both 200 on deepseek; the other six Profiles (glm, kimi, mimo, the mimo-nothink Overlay,
+  minimax, qwen) 200 on both the shipped and the rewritten rosters, and a forced tool call
+  against the rewritten schema returned a valid `tool_use` on all seven; twelve other
+  constructs from the built-in roster (`(?!…)` lookahead, backreferences, `A`, named
+  groups, `\w`, `[\s\S]`, …) all 200 on deepseek — `\0` is the sole offender.
+- Unconditional, not a Scrub token: `\x00` denotes the same character in every regex engine,
+  so there is no per-Profile tradeoff to configure, and the stage is a deterministic pure
+  function of the body (prefix-stability guard, ADR 0002, holds).
+- Recorded, out of scope: deepseek and kimi reject a forced `tool_choice`
+  (`{"type":"tool"}`/`{"type":"any"}`) while thinking is enabled (`Thinking mode does not
+  support this tool_choice` / `tool_choice 'specified' is incompatible with thinking
+  enabled`); no such 400 has appeared in live traffic.

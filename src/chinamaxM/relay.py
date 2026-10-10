@@ -72,7 +72,8 @@ def mutate_body(profile: Profile, body: dict) -> dict:
 
     The canonical order (ADR 0003 as amended): strip the Profile's OWN prefix from
     ``model`` → strip the Claude ``thinking``/``output_config`` form → drop Scrub fields
-    (``cache_control`` recursively) → merge the thinking policy (``extra_body`` sub-keys and
+    (``cache_control`` recursively) → rewrite the ``\\0`` regex escape to ``\\x00`` in every
+    tool-schema ``pattern`` → merge the thinking policy (``extra_body`` sub-keys and
     the remainder both merged at the body root) → merge ``request_extras`` last
     (replace-on-conflict, root merge) → apply the Dispatch marker override last (ADR 0004
     as amended 2026-08-19). Operates on a deep copy and inserts copies of the Profile
@@ -104,6 +105,11 @@ def mutate_body(profile: Profile, body: dict) -> dict:
             _strip_cache_control(result)
         else:
             result.pop(field_name, None)
+
+    # (2b) Tool-schema regex escapes: rewrite the octal NUL escape ``\0`` to ``\x00`` in every
+    #      ``pattern`` under ``tools[]`` — DeepSeek 400s on ``\0``, and ``\x00`` is identical in
+    #      every engine, so the stage is unconditional (ADR 0003 as amended 2026-10-10).
+    _rewrite_tool_patterns(result.get("tools"))
 
     # (3) Merge the Profile thinking policy: extra_body sub-keys and the remainder both at
     #     the body root (so glm/minimax/qwen re-add a bare ``thinking`` field at the end).
@@ -162,6 +168,49 @@ def resolve_dispatch_marker(body: dict) -> str | None:
         if match:
             return match.group(1)
     return None
+
+
+def _rewrite_nul_escape(pattern: str) -> str:
+    """Return ``pattern`` with every regex escape ``\\0`` (octal NUL) rewritten to ``\\x00``.
+
+    DeepSeek's Anthropic endpoint validates each tool-schema ``pattern`` with an engine that
+    rejects the octal NUL escape Claude Code's built-in ``Artifact`` tool ships
+    (``^[^\\0]*$`` → 400 ``is not a "regex"``); ``\\x00`` denotes the same character in every
+    engine (ADR 0003 as amended 2026-10-10). A ``\\0`` directly followed by a decimal digit is
+    a legacy octal escape and is left alone; an escaped-backslash pair ``\\\\`` is consumed
+    whole so a literal backslash followed by ``0`` is never touched.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            nxt = pattern[i + 1]
+            digit_follows = i + 2 < len(pattern) and pattern[i + 2].isdigit()
+            out.append("\\x00" if nxt == "0" and not digit_follows else ch + nxt)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _rewrite_tool_patterns(node: object) -> None:
+    """Recursively rewrite every string-valued ``pattern`` key inside ``node`` in place.
+
+    Applied to ``tools[]`` only, at any depth of ``input_schema``. A PROPERTY named
+    ``pattern`` (a grep-style parameter) has a dict value and is left alone — only a nested
+    string ``pattern`` keyword inside it is rewritten.
+    """
+    if isinstance(node, dict):
+        pattern = node.get("pattern")
+        if isinstance(pattern, str):
+            node["pattern"] = _rewrite_nul_escape(pattern)
+        for value in node.values():
+            _rewrite_tool_patterns(value)
+    elif isinstance(node, list):
+        for item in node:
+            _rewrite_tool_patterns(item)
 
 
 def _strip_cache_control(node: object) -> None:

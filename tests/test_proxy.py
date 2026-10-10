@@ -16,7 +16,7 @@ from aiohttp import web
 from chinamaxM.keyfiles import KeyFileReader, scaffold_key_file
 from chinamaxM.proxy import LOOPBACK_HOST, create_app
 from chinamaxM.registry import Profile, Registry, load_registry
-from chinamaxM.relay import serialize_body
+from chinamaxM.relay import mutate_body, serialize_body
 
 _HOP_BY_HOP = {
     "connection",
@@ -533,6 +533,77 @@ async def test_relay_cache_control_never_reaches_provider(
     assert forwarded["tools"][0] == {"name": "t", "description": "d"}
     assert forwarded["messages"][0]["content"][0]["content"][0] == {"type": "text", "text": "r"}
     assert forwarded["messages"][1]["content"][0] == {"type": "text", "text": "last"}
+
+
+async def test_relay_tool_pattern_nul_escape_rewritten(
+    make_proxy, relay_registry, claude_home, fake_provider
+):
+    """Tool-schema ``pattern`` ``\\0`` escapes egress as ``\\x00`` at any depth; all else verbatim."""
+    claude_home.write_keys(_ALL_KEYS)
+    fake_provider.respond(status=200, body=b"ok")
+    client = await make_proxy(relay_registry, claude_home=str(claude_home.root))
+
+    inbound = {
+        "model": "deepseek/m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "name": "Artifact",
+                "description": "d",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        # The live Claude Code 2.1.29x pattern DeepSeek 400s on.
+                        "file_paths": {
+                            "type": "array",
+                            "items": {"type": "string", "pattern": "^[^\\0]*$"},
+                        },
+                        "after": {"type": "string", "pattern": "^[A-Za-z0-9_=-]{1,4096}$"},
+                        # A grep-style PROPERTY named ``pattern`` is a schema, not a regex.
+                        "pattern": {"type": "string", "pattern": "^(?!\\.)[\\s\\S]+$"},
+                    },
+                },
+            }
+        ],
+    }
+    response = await client.post(
+        "/v1/messages", data=json.dumps(inbound).encode(), skip_auto_headers=["Content-Type"]
+    )
+    assert response.status == 200
+
+    forwarded = json.loads(fake_provider.requests[-1].body)
+    props = forwarded["tools"][0]["input_schema"]["properties"]
+    assert props["file_paths"]["items"]["pattern"] == "^[^\\x00]*$"
+    assert props["after"]["pattern"] == "^[A-Za-z0-9_=-]{1,4096}$"
+    assert props["pattern"] == {"type": "string", "pattern": "^(?!\\.)[\\s\\S]+$"}
+    # Only the escape changed — the tool is otherwise byte-identical.
+    assert forwarded["tools"][0]["name"] == "Artifact"
+    assert forwarded["tools"][0]["description"] == "d"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [
+        ("^[^\\0]*$", "^[^\\x00]*$"),      # the live Artifact pattern
+        ("a\\0", "a\\x00"),                  # trailing NUL escape
+        ("\\\\0", "\\\\0"),                  # literal backslash then '0' — untouched
+        ("\\\\\\0", "\\\\\\x00"),            # escaped backslash, then a NUL escape
+        ("\\01", "\\01"),                    # legacy octal escape — untouched
+        ("^[^\\n\\r]*$", "^[^\\n\\r]*$"),    # other escapes verbatim
+        ("\\", "\\"),                        # dangling backslash preserved
+    ],
+)
+def test_mutate_body_rewrites_only_nul_escape(relay_registry, pattern, expected):
+    """``mutate_body`` rewrites exactly the ``\\0`` escape inside tool-schema patterns; pure."""
+    profile = relay_registry.profiles["deepseek"]
+    body = {
+        "model": "deepseek/m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "t", "input_schema": {"properties": {"x": {"pattern": pattern}}}}],
+    }
+    egress = mutate_body(profile, body)
+    assert egress["tools"][0]["input_schema"]["properties"]["x"]["pattern"] == expected
+    assert body["tools"][0]["input_schema"]["properties"]["x"]["pattern"] == pattern
 
 
 async def test_missing_key_401_names_var_and_file(
